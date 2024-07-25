@@ -69,15 +69,20 @@ pub fn destroy(self: *Aten) void {
     self.allocator.destroy(self);
 }
 
-pub fn alloc(self: *Aten, comptime T: type) !*T {
-    return self.allocator.create(T) catch |err| {
-        TRACE("ATEN-ALLOC-FAIL UID={} TYPE={} ERR={}", .{ self.uid, T, err });
-        return err;
+pub fn alloc(self: *Aten, comptime T: type) *T {
+    return self.allocator.create(T) catch {
+        @panic("Aten.alloc failed");
     };
 }
 
 pub fn dealloc(self: *Aten, object: anytype) void {
     self.allocator.destroy(object);
+}
+
+pub fn dupe(self: *Aten, orig: []const u8) []u8 {
+    return self.allocator.dupe(u8, orig) catch {
+        @panic("Aten.dupe failed");
+    };
 }
 
 pub fn now(self: *Aten) PointInTime {
@@ -141,13 +146,7 @@ pub fn startTimer(
     expires: PointInTime,
     action: Action,
 ) !*Timer {
-    const timer = Timer.make(self, expires, action) catch |err| {
-        TRACE(
-            "ATEN-TIMER-START-FAIL ATEN={} ERR={}",
-            .{ self.uid, err },
-        );
-        return err;
-    };
+    const timer = Timer.make(self, expires, action);
     errdefer timer.destroy();
     self.timers.add(timer) catch |err| {
         TRACE(
@@ -166,13 +165,10 @@ pub fn startTimer(
     return timer;
 }
 
-fn _execute(self: *Aten, action: Action) !*Timer {
-    const timer = Timer.make(self, self.recent, action) catch |err| {
-        TRACE("ATEN-EXECUTE-FAIL ATEN={} ERR={}", .{ self.uid, err });
-        return err;
-    };
+fn _execute(self: *Aten, action: Action) *Timer {
+    const timer = Timer.make(self, self.recent, action);
     errdefer timer.destroy();
-    const node = try self.alloc(TaskQueue.Node);
+    const node = self.alloc(TaskQueue.Node);
     errdefer self.allocator.destroy(node);
     node.* = .{ .data = timer };
     self.immediate.append(node);
@@ -180,8 +176,8 @@ fn _execute(self: *Aten, action: Action) !*Timer {
     return timer;
 }
 
-pub fn execute(self: *Aten, action: Action) !*Timer {
-    const timer = try self._execute(action);
+pub fn execute(self: *Aten, action: Action) *Timer {
+    const timer = self._execute(action);
     TRACE(
         "ATEN-EXECUTE SEQ-NO={} ATEN={} EXPIRES={} ACT={}",
         .{ timer.seq_no, self.uid, timer.expires, timer.action },
@@ -189,7 +185,7 @@ pub fn execute(self: *Aten, action: Action) !*Timer {
     return timer;
 }
 
-pub fn wound(self: *Aten, object: anytype) !void {
+pub fn wound(self: *Aten, object: anytype) void {
     const WoundedObject = struct {
         aten: *Aten,
         obj: @TypeOf(object),
@@ -199,16 +195,10 @@ pub fn wound(self: *Aten, object: anytype) !void {
             w.aten.dealloc(w);
         }
     };
-    const tie = self.alloc(WoundedObject) catch |err| {
-        TRACE("ATEN-WOUND-TIE-FAIL ATEN={} ERR={}", .{ self.uid, err });
-        return err;
-    };
+    const tie = self.alloc(WoundedObject);
     tie.* = .{ .aten = self, .obj = object };
     const action = Action.make(tie, WoundedObject.commit);
-    const timer = self._execute(action) catch |err| {
-        TRACE("ATEN-WOUND-FAIL ATEN={} ERR={}", .{ self.uid, err });
-        return err;
-    };
+    const timer = self._execute(action);
     TRACE("ATEN-WOUND SEQ-NO={} ACT={}", .{ timer.seq_no, action });
 }
 
@@ -391,7 +381,7 @@ pub fn register(self: *Aten, fd: fd_t, action: Action) !void {
         );
         return err;
     };
-    const event = try Event.make(self, action);
+    const event = Event.make(self, action);
     errdefer event.destroy();
     self.multiplexer.register(fd, event) catch |err| {
         TRACE(
@@ -652,12 +642,12 @@ pub const Timer = struct {
         return std.math.order(a.seq_no, b.seq_no);
     }
 
-    fn make(aten: *Aten, expires: PointInTime, action: Action) !*Timer {
-        const timer = try aten.alloc(Timer);
+    fn make(aten: *Aten, expires: PointInTime, action: Action) *Timer {
+        const timer = aten.alloc(Timer);
         errdefer aten.allocator.destroy(timer);
         var stack_trace: ?*Backtrace = null;
         if (TRACE_ENABLED("ATEN-TIMER-BT")) {
-            stack_trace = try aten.alloc(Backtrace);
+            stack_trace = aten.alloc(Backtrace);
             errdefer aten.allocator.destroy(stack_trace.?);
             Backtrace.generate(stack_trace.?);
         }
@@ -699,8 +689,8 @@ pub const Event = struct {
     action: Action,
     stack_trace: ?*Backtrace,
 
-    fn make(aten: *Aten, action: Action) !*Event {
-        const event = try aten.alloc(Event);
+    pub fn make(aten: *Aten, action: Action) *Event {
+        const event = aten.alloc(Event);
         errdefer aten.allocator.destroy(event);
         event.stack_trace = null;
         event.* = .{
@@ -743,7 +733,7 @@ pub const Event = struct {
         switch (self.state) {
             .idle => {
                 self.setState(.triggered);
-                _ = try self.aten.execute(Action.make(self, Event.perform));
+                _ = self.aten.execute(Action.make(self, Event.perform));
             },
             .triggered => {},
             .canceled => self.setState(.triggered),
@@ -1473,6 +1463,9 @@ inline fn fdSyscall(result: anytype) !fd_t {
     return @intCast(try checkSyscall(result));
 }
 
+pub const BlobStream = @import("BlobStream.zig");
 pub const ByteStream = @import("ByteStream.zig");
 pub const PacerStream = @import("PacerStream.zig");
 pub const PipeStream = @import("PipeStream.zig");
+pub const QueueStream = @import("QueueStream.zig");
+pub const ZeroStream = @import("ZeroStream.zig");

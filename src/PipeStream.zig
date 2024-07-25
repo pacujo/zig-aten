@@ -16,7 +16,7 @@ monitored: bool,
 
 const PipeStream = @This();
 const State = enum { open, closed };
-const Monitor = enum { yes, no, if_possible };
+pub const Monitor = enum { yes, no, if_possible };
 
 pub fn read(self: *PipeStream, buffer: []u8) !usize {
     std.debug.assert(self.state != .closed);
@@ -33,28 +33,28 @@ pub fn read(self: *PipeStream, buffer: []u8) !usize {
     );
     TRACE(
         "ATEN-PIPESTREAM-READ-DUMP UID={} DATA={}",
-        .{ self.uid, r3.hex(buffer[0..count]) },
+        .{ self.uid, r3.str(buffer[0..count]) },
     );
     return count;
 }
 
-pub fn close(self: *PipeStream) !void {
+pub fn close(self: *PipeStream) void {
     TRACE("ATEN-PIPESTREAM-CLOSE UID={}", .{self.uid});
     std.debug.assert(self.state != .closed);
     if (self.monitored)
         self.aten.unregister(self.fd) catch unreachable;
     Aten.close(self.fd);
     self.state = .closed;
-    self.aten.wound(self) catch unreachable;
+    self.aten.wound(self);
 }
 
-pub fn subscribe(self: *PipeStream, action: Action) !void {
+pub fn subscribe(self: *PipeStream, action: Action) void {
     TRACE("ATEN-PIPESTREAM-SUBSCRIBE UID={} ACT={}", .{ self.uid, action });
     self.callback = action;
 }
 
 pub fn make(aten: *Aten, fd: fd_t, monitor: Monitor) !*PipeStream {
-    const self = try aten.alloc(PipeStream);
+    const self = aten.alloc(PipeStream);
     self.* = .{
         .aten = aten,
         .uid = r3.newUID(),
@@ -80,8 +80,8 @@ pub fn make(aten: *Aten, fd: fd_t, monitor: Monitor) !*PipeStream {
         };
     }
     TRACE(
-        "ATEN-PIPESTREAM-CREATE UID={} ATEN={} FD={} MONITOR={}:{}",
-        .{ self.uid, aten.uid, fd, monitor, self.monitored },
+        "ATEN-PIPESTREAM-CREATE UID={} PTR={} ATEN={} FD={} MONITOR={}:{}",
+        .{ self.uid, r3.ptr(self), aten.uid, fd, monitor, self.monitored },
     );
     return self;
 }

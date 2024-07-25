@@ -1,6 +1,6 @@
 .{
     .name = "Aten",
-    .version = "0.1.0",
+    .version = "0.1.1",
     .dependencies = .{
         .r3 = .{
             .url = "https://github.com/pacujo/zig-r3/archive/refs/tags/v0.1.1.tar.gz",

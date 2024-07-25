@@ -72,23 +72,23 @@ pub fn read(self: *PacerStream, buffer: []u8) !usize {
     );
     TRACE(
         "ATEN-PACERSTREAM-READ-DUMP UID={} DATA={}",
-        .{ self.uid, r3.hex(buffer[0..count]) },
+        .{ self.uid, r3.str(buffer[0..count]) },
     );
     return count;
 }
 
-pub fn close(self: *PacerStream) !void {
+pub fn close(self: *PacerStream) void {
     TRACE("ATEN-PACERSTREAM-CLOSE UID={}", .{self.uid});
     std.debug.assert(self.state != .closed);
-    try self.underlying_stream.close();
+    self.underlying_stream.close();
     if (self.retry_timer) |timer| {
         timer.cancel();
     }
     self.state = .closed;
-    self.aten.wound(self) catch unreachable;
+    self.aten.wound(self);
 }
 
-pub fn subscribe(self: *PacerStream, action: Action) !void {
+pub fn subscribe(self: *PacerStream, action: Action) void {
     TRACE("ATEN-PACERSTREAM-SUBSCRIBE UID={} ACT={}", .{ self.uid, action });
     self.callback = action;
 }
@@ -99,8 +99,8 @@ pub fn make(
     byterate: Float,
     min_burst: usize,
     max_burst: usize,
-) !*PacerStream {
-    const self = try aten.alloc(PacerStream);
+) *PacerStream {
+    const self = aten.alloc(PacerStream);
     self.* = .{
         .aten = aten,
         .uid = r3.newUID(),
@@ -116,7 +116,7 @@ pub fn make(
     };
     const probe = ByteStream.makeCallbackProbe(PacerStream);
     const action = Action.make(self, probe);
-    try underlying_stream.subscribe(action);
+    underlying_stream.subscribe(action);
     TRACE("ATEN-PACERSTREAM-CREATE UID={} PTR={} ATEN={} U-STR={} " ++
         "RATE={d} MIN={d} MAX={d}", .{
         self.uid,
