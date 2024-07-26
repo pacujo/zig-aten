@@ -1407,6 +1407,9 @@ inline fn fdSyscall(result: anytype) !fd_t {
 
 pub const BlobStream = @import("BlobStream.zig");
 pub const ByteStream = @import("ByteStream.zig");
+pub const DummyStream = @import("DummyStream.zig").makeType;
+pub const DryStream = DummyStream(error.EAGAIN);
+pub const EmptyStream = DummyStream(0);
 pub const PacerStream = @import("PacerStream.zig");
 pub const PipeStream = @import("PipeStream.zig");
 pub const QueueStream = @import("QueueStream.zig");
