@@ -465,11 +465,6 @@ pub const os = switch (@import("builtin").os.tag) {
         const linux = std.os.linux;
         const E = linux.E;
         const errno = linux.E.init;
-        // fn errno(rc: anytype) E {
-        //     const signed: isize = @bitCast(rc);
-        //     const int = if (signed > -4096 and signed < 0) -signed else 0;
-        //     return @enumFromInt(int);
-        // }
         const fd_t = linux.fd_t;
         const close = linux.close;
         const O = linux.O;
