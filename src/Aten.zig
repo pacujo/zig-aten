@@ -145,31 +145,22 @@ pub fn startTimer(
     self: *Aten,
     expires: PointInTime,
     action: Action,
-) !*Timer {
+) *Timer {
     const timer = Timer.make(self, expires, action);
-    errdefer timer.destroy();
-    self.timers.add(timer) catch |err| {
-        TRACE(
-            "ATEN-TIMER-START-ADD-FAIL ATEN={} ERR={}",
-            .{ self.uid, err },
-        );
-        return err;
+    self.timers.add(timer) catch {
+        @panic("Aten.startTimer failed");
     };
     self.wakeUp();
-    TRACE("ATEN-TIMER-START SEQ-NO={} ATEN={} EXPIRES={} ACT={}", .{
-        timer.seq_no,
-        self.uid,
-        expires,
-        action,
-    });
+    TRACE(
+        "ATEN-TIMER-START SEQ-NO={} ATEN={} EXPIRES={} ACT={}",
+        .{ timer.seq_no, self.uid, expires, action },
+    );
     return timer;
 }
 
 fn _execute(self: *Aten, action: Action) *Timer {
     const timer = Timer.make(self, self.recent, action);
-    errdefer timer.destroy();
     const node = self.alloc(TaskQueue.Node);
-    errdefer self.allocator.destroy(node);
     node.* = .{ .data = timer };
     self.immediate.append(node);
     self.wakeUp();
@@ -644,11 +635,9 @@ pub const Timer = struct {
 
     fn make(aten: *Aten, expires: PointInTime, action: Action) *Timer {
         const timer = aten.alloc(Timer);
-        errdefer aten.allocator.destroy(timer);
         var stack_trace: ?*Backtrace = null;
         if (TRACE_ENABLED("ATEN-TIMER-BT")) {
             stack_trace = aten.alloc(Backtrace);
-            errdefer aten.allocator.destroy(stack_trace.?);
             Backtrace.generate(stack_trace.?);
         }
         timer.* = .{
@@ -691,8 +680,6 @@ pub const Event = struct {
 
     pub fn make(aten: *Aten, action: Action) *Event {
         const event = aten.alloc(Event);
-        errdefer aten.allocator.destroy(event);
-        event.stack_trace = null;
         event.* = .{
             .aten = aten,
             .uid = r3.newUID(),

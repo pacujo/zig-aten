@@ -47,7 +47,7 @@ pub fn read(self: *PacerStream, buffer: []u8) !usize {
     const missing_quota = self.min_burst - self.quota;
     if (missing_quota > 0) {
         const delay = missing_quota / self.byterate;
-        self.retry_timer = try self.aten.startTimer(
+        self.retry_timer = self.aten.startTimer(
             t.add(Duration.from(delay)),
             Action.make(self, retry),
         );
