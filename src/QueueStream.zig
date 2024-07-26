@@ -58,20 +58,14 @@ fn doRead(self: *QueueStream, buffer: []u8) !usize {
 pub fn read(self: *QueueStream, buffer: []u8) !usize {
     std.debug.assert(self.consumption_state == .open);
     const count = self.doRead(buffer) catch |err| {
-        TRACE(
-            "ATEN-QUEUESTREAM-READ-FAIL UID={} WANT={} ERR={}",
-            .{ self.uid, buffer.len, err },
-        );
+        TRACE("ATEN-QUEUESTREAM-READ-FAIL UID={} WANT={} ERR={}", //
+            .{ self.uid, buffer.len, err });
         return err;
     };
-    TRACE(
-        "ATEN-QUEUESTREAM-READ UID={} WANT={} GOT={}",
-        .{ self.uid, buffer.len, count },
-    );
-    TRACE(
-        "ATEN-QUEUESTREAM-READ-DUMP UID={} DATA={}",
-        .{ self.uid, r3.str(buffer[0..count]) },
-    );
+    TRACE("ATEN-QUEUESTREAM-READ UID={} WANT={} GOT={}", //
+        .{ self.uid, buffer.len, count });
+    TRACE("ATEN-QUEUESTREAM-READ-DUMP UID={} DATA={}", //
+        .{ self.uid, r3.str(buffer[0..count]) });
     return count;
 }
 
@@ -85,10 +79,8 @@ fn flushQueue(self: *QueueStream) void {
 
 pub fn close(self: *QueueStream) void {
     std.debug.assert(self.consumption_state == .open);
-    TRACE(
-        "ATEN-QUEUESTREAM-CLOSE UID={} P-STATE={}",
-        .{ self.uid, self.production_state },
-    );
+    TRACE("ATEN-QUEUESTREAM-CLOSE UID={} P-STATE={}", //
+        .{ self.uid, self.production_state });
     self.flushQueue();
     self.open.notifier.destroy();
     self.consumption_state = .closed;
@@ -153,18 +145,14 @@ pub fn push(self: *QueueStream, substream: ByteStream) void {
 }
 
 pub fn enqueueBlob(self: *QueueStream, blob: []const u8) void {
-    TRACE(
-        "ATEN-QUEUESTREAM-ENQUEUE-BLOB UID={} BLOB={}",
-        .{ self.uid, r3.str(blob) },
-    );
+    TRACE("ATEN-QUEUESTREAM-ENQUEUE-BLOB UID={} BLOB={}", //
+        .{ self.uid, r3.str(blob) });
     self.enqueue(ByteStream.from(BlobStream.copy(self.aten, blob)));
 }
 
 pub fn pushBlob(self: *QueueStream, blob: []const u8) void {
-    TRACE(
-        "ATEN-QUEUESTREAM-ENQUEUE-BLOB UID={} BLOB={}",
-        .{ self.uid, r3.str(blob) },
-    );
+    TRACE("ATEN-QUEUESTREAM-ENQUEUE-BLOB UID={} BLOB={}", //
+        .{ self.uid, r3.str(blob) });
     self.push(ByteStream.from(BlobStream.copy(self.aten, blob)));
 }
 
