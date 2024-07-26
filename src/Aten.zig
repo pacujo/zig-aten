@@ -1,3 +1,23 @@
+//! A cooperative multitasking framework.
+//!
+//! `Aten` is a callback framework with stackable byte streams. It
+//! provides a main loop, timers and file descriptor monitoring. Its
+//! special twist are byte streams (see `ByteStream`), which resemble
+//! `std.io.Reader` but specialize in nonblocking communication. Also,
+//! `Aten`'s philosophy is not to have writers; instead of A writing
+//! to B, B reads from A.
+//!
+//! `Aten` assumes memory allocation always succeeds and panics (with
+//! `@panic`) if that turns out not to be the case. `Aten` does not
+//! have built-in thread-safety but offers the necessary locking hooks
+//! to work with multithreading.
+//!
+//! `Aten`'s main loop can accommodate other file-descriptor-based
+//! event frameworks. Also, `Aten` can be integrated with foreign main
+//! loops that support file descriptor registration.
+//!
+//! `Aten` depends on the `r3` tracing package.
+
 const std = @import("std");
 const r3 = @import("r3");
 const TRACE = r3.trace;
@@ -15,16 +35,18 @@ mach_clock: if (os.tag == .macos) os.clock_serv_t else void,
 
 const Aten = @This();
 
+/// Create an `Aten` object. Typically, an `Aten` application has a
+/// single `Aten` object.
+///
+/// Internally, `Aten` uses the given allocator extensively and
+/// assumes memory allocation never fails (an error leads to
+/// `@panic`).
+///
+/// On Linux, `epoll` is used for multiplexing. On BSD, `kqueue` is
+/// used.
 pub fn create(allocator: std.mem.Allocator) !*Aten {
-    const aten = allocator.create(Aten) catch |err| {
-        TRACE("ATEN-CREATE-FAIL ERR={}", .{err});
-        return err;
-    };
-    errdefer allocator.destroy(aten);
-    const multiplexer = Multiplexer.make() catch |err| {
-        return err;
-    };
-    errdefer multiplexer.close();
+    const multiplexer = try Multiplexer.make();
+    const aten = allocator.create(Aten) catch @panic("Aten.create failed");
     if (os.tag == .macos) {
         os.host_get_clock_service(
             os.mach_host_self(),
@@ -48,6 +70,8 @@ pub fn create(allocator: std.mem.Allocator) !*Aten {
     return aten;
 }
 
+/// Destroy the `Aten` object. All file descriptor registrations
+/// should be unregistered prior to calling `destroy`.
 pub fn destroy(self: *Aten) void {
     TRACE("ATEN-DESTROY UID={}", .{self.uid});
     self.cancelWakeup();
@@ -58,7 +82,8 @@ pub fn destroy(self: *Aten) void {
     while (true) {
         var it = self.registrations.iterator();
         if (it.next()) |entry| {
-            self.unregister(entry.key_ptr.*) catch unreachable;
+            const fd = entry.key_ptr.*;
+            self.unregister(fd) catch @panic("Aten.destroy failed"); // TBD
         } else break;
     }
     self.registrations.deinit();
@@ -69,22 +94,24 @@ pub fn destroy(self: *Aten) void {
     self.allocator.destroy(self);
 }
 
+/// Allocate memory for the given object type using the `Aten`
+/// object's allocator. The allocation is assumed never to fail.
 pub fn alloc(self: *Aten, comptime T: type) *T {
-    return self.allocator.create(T) catch {
-        @panic("Aten.alloc failed");
-    };
+    return self.allocator.create(T) catch @panic("Aten.alloc failed");
 }
 
+/// Free an object allocated with `alloc`.
 pub fn dealloc(self: *Aten, object: anytype) void {
     self.allocator.destroy(object);
 }
 
+/// Allocate and make a copy of a block of bytes.
 pub fn dupe(self: *Aten, orig: []const u8) []u8 {
-    return self.allocator.dupe(u8, orig) catch {
-        @panic("Aten.dupe failed");
-    };
+    return self.allocator.dupe(u8, orig) catch @panic("Aten.dupe failed");
 }
 
+/// Return the current point in time, which can be assumed to grow
+/// monotonically.
 pub fn now(self: *Aten) PointInTime {
     switch (os.tag) {
         .linux => {
@@ -107,6 +134,8 @@ pub fn now(self: *Aten) PointInTime {
     return self.recent;
 }
 
+// Return the timer that is due to expire first or `null` if no timer
+// is pending.
 fn earliestTimer(self: *Aten) ?*Timer {
     while (self.timers.peek()) |timed| {
         if (timed.canceled) {
@@ -141,15 +170,16 @@ fn earliestTimer(self: *Aten) ?*Timer {
     return null;
 }
 
+/// Start a timer that will expire at a give point in time, or without
+/// delay if the expiry is in the past. Once the timer expires, the
+/// given action is performed.
 pub fn startTimer(
     self: *Aten,
     expires: PointInTime,
     action: Action,
 ) *Timer {
     const timer = Timer.make(self, expires, action);
-    self.timers.add(timer) catch {
-        @panic("Aten.startTimer failed");
-    };
+    self.timers.add(timer) catch @panic("Aten.startTimer failed");
     self.wakeUp();
     TRACE("ATEN-TIMER-START SEQ-NO={} ATEN={} EXPIRES={} ACT={}", //
         .{ timer.seq_no, self.uid, expires, action });
@@ -165,6 +195,9 @@ fn _execute(self: *Aten, action: Action) *Timer {
     return timer;
 }
 
+/// Perform the given action without a delay but not before the main
+/// loop gets control again. Equivalent to starting a timer whose
+/// expiry is in the past.
 pub fn execute(self: *Aten, action: Action) *Timer {
     const timer = self._execute(action);
     TRACE("ATEN-EXECUTE SEQ-NO={} ATEN={} EXPIRES={} ACT={}", //
@@ -172,6 +205,17 @@ pub fn execute(self: *Aten, action: Action) *Timer {
     return timer;
 }
 
+/// Schedule the deallocation of the given object. Often, objects
+/// cannot be freed on the spot because references to them may be
+/// outstanding. Instead of garbage collection or smart pointers,
+/// "wounding" is used. Any pending activities that would access the
+/// wounded objects would find the object in a "zombie" state. Once
+/// all such pending actions have been processed, the object is
+/// deallocated.
+///
+/// The user is responsible for guaranteeing the wounded object will
+/// not be accessed through timers, event registrations, global
+/// variables and similar.
 pub fn wound(self: *Aten, object: anytype) void {
     const WoundedObject = struct {
         aten: *Aten,
@@ -189,10 +233,18 @@ pub fn wound(self: *Aten, object: anytype) void {
     TRACE("ATEN-WOUND SEQ-NO={} ACT={}", .{ timer.seq_no, action });
 }
 
+/// Return the readable file descriptor representing the `Aten`
+/// object. The file descriptor can be registered in foreign main
+/// loops. Whenever the file descriptor becomes readable, `poll` or
+/// `poll2` must be called to dispatch callbacks.
 pub fn getFd(self: *Aten) fd_t {
     return self.multiplexer.getFd();
 }
 
+/// When a foreign main loop is used and `getFd()` becomes readable,
+/// `poll` or `poll2` must be called. If an expiry time is returned,
+/// the caller is responsible for calling `poll` again at that time
+/// (at the latest) even if `getFd()` is not triggered.
 pub fn poll(self: *Aten) !?PointInTime {
     try self.setUpWakeup();
     self.armWakeup();
@@ -232,18 +284,27 @@ pub fn poll(self: *Aten) !?PointInTime {
     return null;
 }
 
+/// On modern Linux systems, `poll2` can be used instead of `poll`.
+/// The return value does not require the foreign main loop to wake up
+/// at a particular time but can simply monitor `getFd()`.
 pub fn poll2(self: *Aten) !void {
     std.debug.assert(self.multiplexer.choice == .epoll_timerfd_multiplex);
     const nextTimeout = try self.poll();
     std.debug.assert(nextTimeout == null);
 }
 
+/// Make `loop` (the native main loop) return immediately.
 pub fn quitLoop(self: *Aten) void {
     TRACE("ATEN-QUIT-LOOP UID={}", .{self.uid});
     self.quit = true;
     self.wakeUp();
 }
 
+/// After finishing the main loop, give an opportunity for immediately
+/// pending actions to be executed. Do not wait for unexpired timers.
+/// If immediate actions trigger further immediate actions, the
+/// process can take a long time or indefinitely. Thus, the `flush`
+/// operation is time-limited.
 pub fn flush(self: *Aten, expires: PointInTime) !void {
     TRACE("ATEN-FLUSH UID={} EXPIRES={}", .{ self.uid, expires });
     while (self.now() < expires) {
@@ -262,7 +323,7 @@ pub fn flush(self: *Aten, expires: PointInTime) !void {
     return error.ETIME;
 }
 
-// Return duration till the next timer expiry.
+// Return the duration till the next timer expiry.
 fn takeImmediateAction(self: *Aten) ?Duration {
     const MaxIOStarvation = 20;
     var i: u8 = MaxIOStarvation;
@@ -292,6 +353,8 @@ fn takeImmediateAction(self: *Aten) ?Duration {
     return Duration.zero;
 }
 
+/// The native, single-threaded `Aten` main loop, which keeps running
+/// until `quitLoop` is called or an uncaught error takes place.
 pub fn loop(self: *Aten) !void {
     TRACE("ATEN-LOOP UID={}", .{self.uid});
     self.quit = false;
@@ -299,6 +362,14 @@ pub fn loop(self: *Aten) !void {
         try self.singleIOCycle(Action.Null, Action.Null);
 }
 
+/// The native `Aten` main loop with generic hooks for locking and
+/// unlocking. The function must be called in a locked state, and it
+/// returns in a locked state. It releases the lock in a safe way.
+///
+/// All callbacks issued by `loopProtected` take place in a locked
+/// state. Other threads invoking `Aten` functions must do it in a
+/// locked state, as well, as all `Async` activities must be strictly
+/// serialized.
 pub fn loopProtected(self: *Aten, lock: Action, unlock: Action) !void {
     TRACE("ATEN-LOOP-PROTECTED UID={}", .{self.uid});
     try self.setUpWakeup();
@@ -309,6 +380,7 @@ pub fn loopProtected(self: *Aten, lock: Action, unlock: Action) !void {
     }
 }
 
+// The common innards of `loop` and `loopProtected`.
 fn singleIOCycle(self: *Aten, lock: Action, unlock: Action) !void {
     const MaxIOBurst = 20;
     const delay = self.takeImmediateAction();
@@ -342,6 +414,11 @@ fn singleIOCycle(self: *Aten, lock: Action, unlock: Action) !void {
     }
 }
 
+/// Register a file descriptor for edge-triggered monitoring. The
+/// given action is invoked whenever the file descriptor becomes
+/// readable or writable. However, the callback is guaranteed only if
+/// the user has previously run into `error.EAGAIN` or
+/// `error.EINPROGRESS`. A callback can also be invoked spuriously.
 pub fn register(self: *Aten, fd: fd_t, action: Action) !void {
     nonblock(fd) catch |err| {
         TRACE("ATEN-REGISTER-NONBLOCK-FAIL UID={} FD={} ACT={} ERR={}", //
@@ -360,6 +437,9 @@ pub fn register(self: *Aten, fd: fd_t, action: Action) !void {
     TRACE("ATEN-REGISTER UID={} FD={} ACT={}", .{ self.uid, fd, action });
 }
 
+/// Register a file descriptor for level-triggered monitoring. The
+/// given action is invoked whenever the file descriptor is readable.
+/// A callback can also be invoked spuriously.
 pub fn registerOldSchool(self: *Aten, fd: fd_t, action: Action) !void {
     nonblock(fd) catch |err| {
         TRACE("ATEN-REGISTER-OLD-SCHOOL-NONBLOCK-FAIL " ++
@@ -380,6 +460,8 @@ pub fn registerOldSchool(self: *Aten, fd: fd_t, action: Action) !void {
         .{ self.uid, fd, action });
 }
 
+/// Modify the monitoring condition of a file descriptor that is
+/// monitored in the level-triggered mode.
 pub fn modifyOldSchool(
     self: *Aten,
     fd: fd_t,
@@ -402,6 +484,7 @@ pub fn modifyOldSchool(
         .{ self.uid, fd, readable, writable });
 }
 
+/// Cancel the registration of a file descriptor.
 pub fn unregister(self: *Aten, fd: fd_t) !void {
     self.multiplexer.unregister(fd) catch |err| {
         TRACE("ATEN-UNREGISTER-FAIL UID={} FD={}", .{ self.uid, fd });
@@ -414,6 +497,7 @@ pub fn unregister(self: *Aten, fd: fd_t) !void {
     TRACE("ATEN-UNREGISTER UID={} FD={}", .{ self.uid, fd });
 }
 
+// Wake up the (native or foreign) main loop from any thread.
 fn wakeUp(self: *Aten) void {
     TRACE("ATEN-WAKE-UP UID={}", .{self.uid});
     self.multiplexer.wakeUp();
@@ -423,6 +507,8 @@ fn cancelWakeup(self: *Aten) void {
     self.multiplexer.cancelWakeup();
 }
 
+/// The operating-system primitives as seen by `Aten`. The
+/// applications are encouraged to use the same primitives.
 pub const os = switch (@import("builtin").os.tag) {
     .linux => |os_tag| struct {
         const tag = os_tag;
@@ -467,10 +553,13 @@ pub const os = switch (@import("builtin").os.tag) {
     },
 };
 
+/// A typed, parameterless callback interface that is used for
+/// signaling, triggering etc.
 pub const Action = struct {
     object: *const anyopaque,
     method: *const fn (*const anyopaque) void,
 
+    /// Create an `Action` value.
     pub fn make(
         object: anytype,
         method: *const fn (@TypeOf(object)) void,
@@ -481,26 +570,29 @@ pub const Action = struct {
         };
     }
 
+    /// Apply the `Action`'s method to its object.
     pub fn perform(self: Action) void {
         self.method(self.object);
     }
 
+    /// A representation of an `Action` value.
     pub fn format(
         self: Action,
         _: []const u8,
         _: std.fmt.FormatOptions,
         writer: anytype,
     ) !void {
-        try writer.print(
-            "{x}:{x}",
-            .{ @intFromPtr(self.object), @intFromPtr(self.method) },
-        );
+        try writer.print("{x}/{x}", //
+            .{ @intFromPtr(self.object), @intFromPtr(self.method) });
     }
 
     fn noOp(_: *const void) void {}
+
+    /// An action that does nothing.
     pub const Null = Action.make(&{}, noOp);
 };
 
+/// A black-box data type representing a point in time.
 pub const PointInTime = struct {
     ns_since_epoch: u64,
 
@@ -521,33 +613,79 @@ pub const PointInTime = struct {
     pub fn order(self: PointInTime, other: PointInTime) std.math.Order {
         return std.math.order(self.ns_since_epoch, other.ns_since_epoch);
     }
+
+    /// A representation of a `PointInTime` value.
+    pub fn format(
+        self: PointInTime,
+        _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        try writer.print("{}.{:0>9}", .{
+            @divFloor(self.ns_since_epoch, 1_000_000_000),
+            @mod(self.ns_since_epoch, 1_000_000_000),
+        });
+    }
 };
 
+/// A black-box data type representing a duration.
 pub const Duration = struct {
     ns_delta: i64,
 
+    /// A zero duration.
     pub const zero = Duration{ .ns_delta = 0 };
+
+    /// A nanosecond duration.
     pub const ns = Duration{ .ns_delta = 1 };
+
+    /// A microsecond duration.
     pub const us = ns.mul(1_000);
+
+    /// A millisecond duration.
     pub const ms = us.mul(1_000);
+
+    /// A one-second duration.
     pub const s = ms.mul(1_000);
+
+    /// A one-minute duration.
     pub const min = s.mul(60);
+
+    /// A one-hour duration.
     pub const h = min.mul(60);
+
+    /// A 24-hour duration.
     pub const day = h.mul(24);
 
+    /// Return the duration multiplied by a `multiplier`.
     pub fn mul(self: Duration, multiplier: anytype) Duration {
         return .{ .ns_delta = self.ns_delta * multiplier };
     }
 
+    /// The sum of two durations.
+    pub fn add(self: Duration, other: Duration) PointInTime {
+        return .{ .ns_delta = self.ns_delta +% other.ns_delta };
+    }
+
+    pub fn sub(self: Duration, other: Duration) Duration {
+        return .{ .ns_delta = self.ns_delta -% other.ns_delta };
+    }
+
+    pub fn order(self: Duration, other: Duration) std.math.Order {
+        return std.math.order(self.ns_delta, other.ns_delta);
+    }
+
+    /// Return the duration in seconds converted to a numeric type.
     pub fn to(self: Duration, comptime T: type) T {
         const fdelta: T = @floatFromInt(self.ns_delta);
         return fdelta * 1e-9;
     }
 
+    /// Construct a duration from a number of seconds.
     pub fn from(seconds: anytype) Duration {
         return .{ .ns_delta = @intFromFloat(seconds * 1e9) };
     }
 
+    /// Return `true` iff the duration is less than zero.
     pub fn done(self: Duration) bool {
         return self.ns_delta <= 0;
     }
@@ -564,6 +702,7 @@ pub const Duration = struct {
         return -1;
     }
 
+    /// Convert a duration to a `timespec` value or `null` to `null`.
     pub fn toTimespec(delay: ?Duration) ?*os.timespec {
         if (delay) |duration| {
             return .{
@@ -573,8 +712,23 @@ pub const Duration = struct {
         }
         return null;
     }
+
+    /// A representation of a `Duration` value.
+    pub fn format(
+        self: Duration,
+        _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        try writer.print("{}.{:0>9}", .{
+            @divFloor(self.ns_delta, 1_000_000_000),
+            @as(u64, @intCast(@mod(self.ns_delta, 1_000_000_000))),
+        });
+    }
 };
 
+/// `Aten`'s timer object used for scheduled timers as well as
+/// immediate actions.
 pub const Timer = struct {
     var next_seq_no: u64 = 0;
 
@@ -622,12 +776,20 @@ pub const Timer = struct {
         self.canceled = true;
     }
 
+    /// Cancel a timer. A timer is canceled when it expires and its
+    /// `Action` callback is invoked. The caller should make sure the
+    /// timer is not canceled afterward.
     pub fn cancel(self: *Timer) void {
         TRACE("ATEN-TIMER-CANCEL SEQ-NO={}", .{self.seq_no});
         self._cancel();
     }
 };
 
+/// A "callback absorber" object. As callbacks are generated from
+/// various sources, there is a risk of a high rate of spurious
+/// notifications. An `Event` object can be triggered arbitrarily
+/// often, but multiple pending callback events are folded into a
+/// single callback event.
 pub const Event = struct {
     const State = enum { idle, triggered, canceled, zombie };
 
@@ -637,6 +799,7 @@ pub const Event = struct {
     action: Action,
     stack_trace: ?*Backtrace,
 
+    /// Create an event.
     pub fn make(aten: *Aten, action: Action) *Event {
         const event = aten.alloc(Event);
         event.* = .{
@@ -670,6 +833,8 @@ pub const Event = struct {
         }
     }
 
+    /// Trigger an event. The associated callback action is guaranteed
+    /// to be invoked subsequently at least once.
     pub fn trigger(self: *Event) !void {
         TRACE("ATEN-EVENT-TRIGGER UID={}", .{self.uid});
         switch (self.state) {
@@ -683,6 +848,7 @@ pub const Event = struct {
         }
     }
 
+    /// Cancel an event. Even pending callbacks are canceled right away.
     pub fn cancel(self: *Event) void {
         TRACE("ATEN-EVENT-CANCEL UID={}", .{self.uid});
         switch (self.state) {
@@ -692,6 +858,7 @@ pub const Event = struct {
         }
     }
 
+    /// Destroy an event.
     pub fn destroy(self: *Event) void {
         TRACE("ATEN-EVENT-DESTROY UID={}", .{self.uid});
         switch (self.state) {
@@ -704,13 +871,15 @@ pub const Event = struct {
 
 const TaskQueue = std.DoublyLinkedList(*Timer);
 const TimerQueue = std.PriorityQueue(*Timer, void, Timer.compare);
-pub const fd_t = os.fd_t;
 const RegistrationMap = std.AutoHashMap(fd_t, *Event);
 
+/// The file descriptor type.
+pub const fd_t = os.fd_t;
+
 const MultiplexMechanism = enum {
-    epoll_timerfd_multiplex,
-    epoll_pipe_multiplex,
-    kqueue_multiplex,
+    epoll_timerfd_multiplex, // Linux with timerfd
+    epoll_pipe_multiplex, // Linux without timerfd
+    kqueue_multiplex, // BSD
 
     fn choice() MultiplexMechanism {
         return switch (os.tag) {
@@ -719,13 +888,18 @@ const MultiplexMechanism = enum {
         };
     }
 };
+
+// A `Multiplexer` encapsulates the operating-system-specific
+// multiplexing and weake-up mechanisms for an `Aten` object.
 const Multiplexer = union(MultiplexMechanism) {
     pub const choice = MultiplexMechanism.choice();
     const TimerFdEvent: Event = undefined; // a dummy sentinel
 
     epoll_timerfd_multiplex: struct {
         epollfd: fd_t,
-        timerfd: ?fd_t = null, // set up only if needed
+        // A timerfd is set up only if needed (multithreaded or
+        // foreign main loop).
+        timerfd: ?fd_t = null,
     },
     epoll_pipe_multiplex: struct {
         epollfd: fd_t,
@@ -1095,19 +1269,23 @@ const Backtrace = struct {
     }
 };
 
+/// The `read` system call of the operating system.
 pub fn read(fd: fd_t, buffer: []u8) !usize {
     return checkSyscall(os.read(fd, buffer.ptr, buffer.len));
 }
 
+/// The `close` system call of the operating system.
 pub fn close(fd: fd_t) void {
     doSyscall(os.close(fd)) catch unreachable;
 }
 
+// Turn on the `FD_CLOEXEC` flag of the file descriptor.
 fn cloexec(fd: fd_t) !void {
     const flags = try checkSyscall(os.fcntl(fd, os.F.GETFD, 0));
     try doSyscall(os.fcntl(fd, os.F.SETFD, flags | os.FD_CLOEXEC));
 }
 
+// Turn on the `O_NONBLOCK` flag of the file descriptor.
 fn nonblock(fd: fd_t) !void {
     var flags = try checkSyscall(os.fcntl(fd, os.F.GETFL, 0));
     var o_flags: os.O = @bitCast(@as(u32, @intCast(flags)));
@@ -1116,6 +1294,7 @@ fn nonblock(fd: fd_t) !void {
     try doSyscall(os.fcntl(fd, os.F.SETFL, flags));
 }
 
+// Native error constants corresponding to the familiar `errno` enums.
 const SystemError = error{
     EPERM,
     ENOENT,
@@ -1390,6 +1569,8 @@ fn errnoToError(err: os.E) SystemError {
     };
 }
 
+// Trigger an error if the system call result indicates one.
+// Otherwise, pass the system call return value to the caller as-is.
 inline fn checkSyscall(result: anytype) !@TypeOf(result) {
     return switch (os.errno(result)) {
         .SUCCESS => result,
@@ -1397,20 +1578,47 @@ inline fn checkSyscall(result: anytype) !@TypeOf(result) {
     };
 }
 
+// Trigger an error if the system call result indicates one.
+// Otherwise, absorb the return value.
 inline fn doSyscall(result: anytype) !void {
     _ = try checkSyscall(result);
 }
 
+// Trigger an error if the system call result indicates one.
+// Otherwise, pass the system call return value to the caller as a
+// file descriptor.
 inline fn fdSyscall(result: anytype) !fd_t {
     return @intCast(try checkSyscall(result));
 }
 
+/// A byte stream that emits given bytes.
 pub const BlobStream = @import("BlobStream.zig");
+
+/// The generic byte stream interface. Any byte stream object `s` can
+/// be converted to a `ByteStream` value with `ByteStream.from(s)`.
 pub const ByteStream = @import("ByteStream.zig");
+
+/// A byte stream template. The returned byte stream type hard-codes
+/// the `read` return value.
 pub const DummyStream = @import("DummyStream.zig").makeType;
+
+/// A byte stream that never emits a byte but responds to `read` with
+/// `error.EAGAIN`.
 pub const DryStream = DummyStream(error.EAGAIN);
+
+/// A byte stream that emits an end of file (that is, 0).
 pub const EmptyStream = DummyStream(0);
+
+/// A byte stream that emits the output of the underlying byte stream
+/// at a constant rate.
 pub const PacerStream = @import("PacerStream.zig");
+
+/// A byte stream wrapper for an open, readable file descriptor.
 pub const PipeStream = @import("PipeStream.zig");
+
+/// A byte stream that allows concatenating byte streams dynamically.
+/// In particular, a `QueueStream` is used to transmit data.
 pub const QueueStream = @import("QueueStream.zig");
+
+/// A byte stream that emits an unending sequence of zero bytes.
 pub const ZeroStream = @import("ZeroStream.zig");
