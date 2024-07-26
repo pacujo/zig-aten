@@ -177,6 +177,7 @@ fn wrapUp(self: *QueueStream) void {
 
 pub fn terminate(self: *QueueStream) void {
     std.debug.assert(self.production_state == .open);
+    TRACE("ATEN-QUEUESTREAM-TERMINATE UID={}", .{self.uid});
     switch (self.consumption_state) {
         .open => {
             self.production_state = .terminated;
