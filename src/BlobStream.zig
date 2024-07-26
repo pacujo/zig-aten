@@ -19,14 +19,10 @@ pub fn read(self: *BlobStream, buffer: []u8) !usize {
     const count = @min(buffer.len, self.tail.len);
     @memcpy(buffer[0..count], self.tail[0..count]);
     self.tail = self.tail[count..];
-    TRACE(
-        "ATEN-BLOBSTREAM-READ UID={} WANT={} GOT={}",
-        .{ self.uid, buffer.len, count },
-    );
-    TRACE(
-        "ATEN-BLOBSTREAM-READ-TEXT UID={} TEXT={}",
-        .{ self.uid, r3.str(buffer[0..count]) },
-    );
+    TRACE("ATEN-BLOBSTREAM-READ UID={} WANT={} GOT={}", //
+        .{ self.uid, buffer.len, count });
+    TRACE("ATEN-BLOBSTREAM-READ-TEXT UID={} TEXT={}", //
+        .{ self.uid, r3.str(buffer[0..count]) });
     return count;
 }
 
@@ -50,14 +46,10 @@ fn _make(aten: *Aten, blob: []const u8, memory: ?[]u8) *BlobStream {
         .tail = blob,
         .memory = memory,
     };
-    TRACE(
-        "ATEN-BLOBSTREAM-CREATE UID={} PTR={} ATEN={} SIZE={}",
-        .{ self.uid, r3.ptr(self), aten.uid, blob.len },
-    );
-    TRACE(
-        "ATEN-BLOBSTREAM-CREATE-TEXT UID={} TEXT={}",
-        .{ self.uid, r3.str(blob) },
-    );
+    TRACE("ATEN-BLOBSTREAM-CREATE UID={} PTR={} ATEN={} SIZE={}", //
+        .{ self.uid, r3.ptr(self), aten.uid, blob.len });
+    TRACE("ATEN-BLOBSTREAM-CREATE-TEXT UID={} TEXT={}", //
+        .{ self.uid, r3.str(blob) });
     return self;
 }
 

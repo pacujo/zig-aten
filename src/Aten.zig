@@ -151,10 +151,8 @@ pub fn startTimer(
         @panic("Aten.startTimer failed");
     };
     self.wakeUp();
-    TRACE(
-        "ATEN-TIMER-START SEQ-NO={} ATEN={} EXPIRES={} ACT={}",
-        .{ timer.seq_no, self.uid, expires, action },
-    );
+    TRACE("ATEN-TIMER-START SEQ-NO={} ATEN={} EXPIRES={} ACT={}", //
+        .{ timer.seq_no, self.uid, expires, action });
     return timer;
 }
 
@@ -169,10 +167,8 @@ fn _execute(self: *Aten, action: Action) *Timer {
 
 pub fn execute(self: *Aten, action: Action) *Timer {
     const timer = self._execute(action);
-    TRACE(
-        "ATEN-EXECUTE SEQ-NO={} ATEN={} EXPIRES={} ACT={}",
-        .{ timer.seq_no, self.uid, timer.expires, timer.action },
-    );
+    TRACE("ATEN-EXECUTE SEQ-NO={} ATEN={} EXPIRES={} ACT={}", //
+        .{ timer.seq_no, self.uid, timer.expires, timer.action });
     return timer;
 }
 
@@ -206,33 +202,25 @@ pub fn poll(self: *Aten) !?PointInTime {
         return err;
     };
     if (count == 1) {
-        TRACE(
-            "ATEN-POLL-CALL-BACK UID={} EVENT={}",
-            .{ self.uid, events[0].uid },
-        );
+        TRACE("ATEN-POLL-CALL-BACK UID={} EVENT={}", //
+            .{ self.uid, events[0].uid });
         events[0].trigger();
         return self.scheduleWakeup(self.recent);
     }
     TRACE("ATEN-POLL-SPURIOUS UID={}", .{self.uid});
     if (self.earliestTimer()) |timer| {
         if (timer.expires > self.now()) {
-            TRACE(
-                "ATEN-POLL-NEXT-TIMER UID={} EXPIRES={}",
-                .{ self.uid, timer.expires },
-            );
+            TRACE("ATEN-POLL-NEXT-TIMER UID={} EXPIRES={}", //
+                .{ self.uid, timer.expires });
             return self.scheduleWakeup(timer.expires);
         }
         const action = timer.action;
-        TRACE(
-            "ATEN-POLL-TIMEOUT SEQ-NO={} ACT={}",
-            .{ timer.seq_no, timer.action },
-        );
+        TRACE("ATEN-POLL-TIMEOUT SEQ-NO={} ACT={}", //
+            .{ timer.seq_no, timer.action });
         if (TRACE_ENABLED("ATEN-TIMER-BT")) {
             if (timer.stack_trace) |stack_trace| {
-                TRACE(
-                    "ATEN-TIMER-BT SEQ-NO={} BT={}",
-                    .{ timer.seq_no, stack_trace },
-                );
+                TRACE("ATEN-TIMER-BT SEQ-NO={} BT={}", //
+                    .{ timer.seq_no, stack_trace });
             }
         }
         timer.cancel();
@@ -282,22 +270,16 @@ fn takeImmediateAction(self: *Aten) ?Duration {
         if (self.earliestTimer()) |timer| {
             const delay = timer.expires.sub(self.now());
             if (!delay.done()) {
-                TRACE(
-                    "ATEN-LOOP-NEXT-TIMER UID={} EXPIRES={}",
-                    .{ self.uid, timer.expires },
-                );
+                TRACE("ATEN-LOOP-NEXT-TIMER UID={} EXPIRES={}", //
+                    .{ self.uid, timer.expires });
                 return delay;
             }
-            TRACE(
-                "ATEN-LOOP-TIMEOUT UID={} ACT={}",
-                .{ self.uid, timer.action },
-            );
+            TRACE("ATEN-LOOP-TIMEOUT UID={} ACT={}", //
+                .{ self.uid, timer.action });
             if (TRACE_ENABLED("ATEN-TIMER-BT")) {
                 if (timer.stack_trace) |stack_trace| {
-                    TRACE(
-                        "ATEN-TIMER-BT SEQ-NO={} BT={}",
-                        .{ timer.seq_no, stack_trace },
-                    );
+                    TRACE("ATEN-TIMER-BT SEQ-NO={} BT={}", //
+                        .{ timer.seq_no, stack_trace });
                 }
             }
             timer.cancel();
@@ -350,35 +332,27 @@ fn singleIOCycle(self: *Aten, lock: Action, unlock: Action) !void {
     for (0..count) |i| {
         if (events[i] != &Multiplexer.TimerFdEvent) {
             events[i].trigger() catch |err| {
-                TRACE(
-                    "ATEN-LOOP-TRIGGER-FAIL UID={} ERR={}",
-                    .{ self.uid, err },
-                );
+                TRACE("ATEN-LOOP-TRIGGER-FAIL UID={} ERR={}", //
+                    .{ self.uid, err });
                 return err;
             };
-            TRACE(
-                "ATEN-LOOP-EXECUTE UID={} EVENT={}",
-                .{ self.uid, events[i].uid },
-            );
+            TRACE("ATEN-LOOP-EXECUTE UID={} EVENT={}", //
+                .{ self.uid, events[i].uid });
         }
     }
 }
 
 pub fn register(self: *Aten, fd: fd_t, action: Action) !void {
     nonblock(fd) catch |err| {
-        TRACE(
-            "ATEN-REGISTER-NONBLOCK-FAIL UID={} FD={} ACT={} ERR={}",
-            .{ self.uid, fd, action, err },
-        );
+        TRACE("ATEN-REGISTER-NONBLOCK-FAIL UID={} FD={} ACT={} ERR={}", //
+            .{ self.uid, fd, action, err });
         return err;
     };
     const event = Event.make(self, action);
     errdefer event.destroy();
     self.multiplexer.register(fd, event) catch |err| {
-        TRACE(
-            "ATEN-REGISTER-FAIL UID={} FD={} ACT={} ERR={}",
-            .{ self.uid, fd, action, err },
-        );
+        TRACE("ATEN-REGISTER-FAIL UID={} FD={} ACT={} ERR={}", //
+            .{ self.uid, fd, action, err });
         return err;
     };
     self.registrations.put(fd, event) catch unreachable;
@@ -388,28 +362,22 @@ pub fn register(self: *Aten, fd: fd_t, action: Action) !void {
 
 pub fn registerOldSchool(self: *Aten, fd: fd_t, action: Action) !void {
     nonblock(fd) catch |err| {
-        TRACE(
-            "ATEN-REGISTER-OLD-SCHOOL-NONBLOCK-FAIL " ++
-                "UID={} FD={} ACT={} ERR={}",
-            .{ self.uid, fd, action, err },
-        );
+        TRACE("ATEN-REGISTER-OLD-SCHOOL-NONBLOCK-FAIL " ++
+            "UID={} FD={} ACT={} ERR={}", //
+            .{ self.uid, fd, action, err });
         return err;
     };
     const event = try Event.make(self, action);
     errdefer event.destroy();
     self.multiplexer.registerOldSchool(fd, event) catch |err| {
-        TRACE(
-            "ATEN-REGISTER-OLD-SCHOOL-FAIL UID={} FD={} ACT={} ERR={}",
-            .{ self.uid, fd, action, err },
-        );
+        TRACE("ATEN-REGISTER-OLD-SCHOOL-FAIL UID={} FD={} ACT={} ERR={}", //
+            .{ self.uid, fd, action, err });
         return err;
     };
     self.registrations.put(fd, event) catch unreachable;
     self.wakeUp();
-    TRACE(
-        "ATEN-REGISTER-OLD-SCHOOL UID={} FD={} ACT={}",
-        .{ self.uid, fd, action },
-    );
+    TRACE("ATEN-REGISTER-OLD-SCHOOL UID={} FD={} ACT={}", //
+        .{ self.uid, fd, action });
 }
 
 pub fn modifyOldSchool(
@@ -425,17 +393,13 @@ pub fn modifyOldSchool(
         readable,
         writable,
     ) catch |err| {
-        TRACE(
-            "ATEN-MODIFY-OLD-SCHOOL-FAIL UID={} FD={} RD={} WR={} ERR={}",
-            .{ self.uid, fd, readable, writable, err },
-        );
+        TRACE("ATEN-MODIFY-OLD-SCHOOL-FAIL UID={} FD={} RD={} WR={} ERR={}", //
+            .{ self.uid, fd, readable, writable, err });
         return err;
     };
     self.wakeUp();
-    TRACE(
-        "ATEN-MODIFY-OLD-SCHOOL UID={} FD={} RD={} WR={}",
-        .{ self.uid, fd, readable, writable },
-    );
+    TRACE("ATEN-MODIFY-OLD-SCHOOL UID={} FD={} RD={} WR={}", //
+        .{ self.uid, fd, readable, writable });
 }
 
 pub fn unregister(self: *Aten, fd: fd_t) !void {
@@ -682,18 +646,14 @@ pub const Event = struct {
             .action = action,
             .stack_trace = null,
         };
-        TRACE(
-            "ATEN-EVENT-CREATE UID={} ATEN={} ACT={}",
-            .{ event.uid, aten.uid, action },
-        );
+        TRACE("ATEN-EVENT-CREATE UID={} ATEN={} ACT={}", //
+            .{ event.uid, aten.uid, action });
         return event;
     }
 
     fn setState(self: *Event, state: State) void {
-        TRACE(
-            "ATEN-EVENT-SET-STATE UID={} OLD={} NEW={}",
-            .{ self.uid, self.state, state },
-        );
+        TRACE("ATEN-EVENT-SET-STATE UID={} OLD={} NEW={}", //
+            .{ self.uid, self.state, state });
         self.state = state;
     }
 

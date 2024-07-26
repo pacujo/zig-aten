@@ -21,20 +21,14 @@ pub const Monitor = enum { yes, no, if_possible };
 pub fn read(self: *PipeStream, buffer: []u8) !usize {
     std.debug.assert(self.state != .closed);
     const count = Aten.read(self.fd, buffer) catch |err| {
-        TRACE(
-            "ATEN-PIPESTREAM-READ-FAIL UID={} WANT={} ERR={}",
-            .{ self.uid, buffer.len, err },
-        );
+        TRACE("ATEN-PIPESTREAM-READ-FAIL UID={} WANT={} ERR={}", //
+            .{ self.uid, buffer.len, err });
         return err;
     };
-    TRACE(
-        "ATEN-PIPESTREAM-READ UID={} WANT={} GOT={}",
-        .{ self.uid, buffer.len, count },
-    );
-    TRACE(
-        "ATEN-PIPESTREAM-READ-DUMP UID={} DATA={}",
-        .{ self.uid, r3.str(buffer[0..count]) },
-    );
+    TRACE("ATEN-PIPESTREAM-READ UID={} WANT={} GOT={}", //
+        .{ self.uid, buffer.len, count });
+    TRACE("ATEN-PIPESTREAM-READ-DUMP UID={} DATA={}", //
+        .{ self.uid, r3.str(buffer[0..count]) });
     return count;
 }
 
@@ -70,18 +64,14 @@ pub fn make(aten: *Aten, fd: fd_t, monitor: Monitor) !*PipeStream {
         aten.register(fd, action) catch |err| {
             self.monitored = false;
             if (monitor == .yes or err != error.EPERM) {
-                TRACE(
-                    "ATEN-PIPESTREAM-CREATE-FAIL UID={} ATEN={} FD={} " ++
-                        "MONITOR={} ERR={}",
-                    .{ self.uid, aten.uid, fd, monitor, err },
-                );
+                TRACE("ATEN-PIPESTREAM-CREATE-FAIL UID={} ATEN={} FD={} " ++
+                    "MONITOR={} ERR={}", //
+                    .{ self.uid, aten.uid, fd, monitor, err });
                 return err;
             }
         };
     }
-    TRACE(
-        "ATEN-PIPESTREAM-CREATE UID={} PTR={} ATEN={} FD={} MONITOR={}:{}",
-        .{ self.uid, r3.ptr(self), aten.uid, fd, monitor, self.monitored },
-    );
+    TRACE("ATEN-PIPESTREAM-CREATE UID={} PTR={} ATEN={} FD={} MONITOR={}:{}", //
+        .{ self.uid, r3.ptr(self), aten.uid, fd, monitor, self.monitored });
     return self;
 }

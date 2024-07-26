@@ -15,10 +15,8 @@ const State = enum { open, closed };
 pub fn read(self: *ZeroStream, buffer: []u8) !usize {
     std.debug.assert(self.state != .closed);
     @memset(buffer, 0);
-    TRACE(
-        "ATEN-ZEROSTREAM-READ UID={} WANT={} GOT={}",
-        .{ self.uid, buffer.len, buffer.len },
-    );
+    TRACE("ATEN-ZEROSTREAM-READ UID={} WANT={} GOT={}", //
+        .{ self.uid, buffer.len, buffer.len });
     return buffer.len;
 }
 
@@ -40,9 +38,7 @@ pub fn make(aten: *Aten) *ZeroStream {
         .uid = r3.newUID(),
         .state = .open,
     };
-    TRACE(
-        "ATEN-ZEROSTREAM-CREATE UID={} PTR={} ATEN={}",
-        .{ self.uid, r3.ptr(self), aten.uid },
-    );
+    TRACE("ATEN-ZEROSTREAM-CREATE UID={} PTR={} ATEN={}", //
+        .{ self.uid, r3.ptr(self), aten.uid });
     return self;
 }

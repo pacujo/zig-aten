@@ -51,29 +51,21 @@ pub fn read(self: *PacerStream, buffer: []u8) !usize {
             t.add(Duration.from(delay)),
             Action.make(self, retry),
         );
-        TRACE(
-            "ATEN-PACERSTREAM-READ-POSTPONE UID={} WANT={} DELAY={d}",
-            .{ self.uid, buffer.len, delay },
-        );
+        TRACE("ATEN-PACERSTREAM-READ-POSTPONE UID={} WANT={} DELAY={d}", //
+            .{ self.uid, buffer.len, delay });
         return error.EAGAIN;
     }
     const limit = @min(buffer.len, @as(usize, @intFromFloat(self.quota)));
     const count = self.underlying_stream.read(buffer[0..limit]) catch |err| {
-        TRACE(
-            "ATEN-PACERSTREAM-READ-FAIL UID={} WANT={} LIMIT={} ERR={}",
-            .{ self.uid, buffer.len, limit, err },
-        );
+        TRACE("ATEN-PACERSTREAM-READ-FAIL UID={} WANT={} LIMIT={} ERR={}", //
+            .{ self.uid, buffer.len, limit, err });
         return err;
     };
     self.quota -= @floatFromInt(count);
-    TRACE(
-        "ATEN-PACERSTREAM-READ UID={} WANT={} LIMIT={} GOT={}",
-        .{ self.uid, buffer.len, limit, count },
-    );
-    TRACE(
-        "ATEN-PACERSTREAM-READ-DUMP UID={} DATA={}",
-        .{ self.uid, r3.str(buffer[0..count]) },
-    );
+    TRACE("ATEN-PACERSTREAM-READ UID={} WANT={} LIMIT={} GOT={}", //
+        .{ self.uid, buffer.len, limit, count });
+    TRACE("ATEN-PACERSTREAM-READ-DUMP UID={} DATA={}", //
+        .{ self.uid, r3.str(buffer[0..count]) });
     return count;
 }
 
