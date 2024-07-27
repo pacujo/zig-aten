@@ -1172,7 +1172,7 @@ const Multiplexer = union(MultiplexMechanism) {
     }
 
     fn setUpWakeup(self: *Multiplexer) !void {
-        return switch (choice) {
+        switch (choice) {
             .epoll_timerfd_multiplex => {
                 if (self.epoll_timerfd_multiplex.timerfd != null)
                     return;
@@ -1190,13 +1190,15 @@ const Multiplexer = union(MultiplexMechanism) {
                 self.epoll_pipe_multiplex.wakeup_readfd = fds[0];
                 self.epoll_pipe_multiplex.wakeup_writefd = fds[1];
                 try nonblock(fds[1]);
-                self.armWakeup();
                 try self.register(fds[1], &TimerFdEvent);
             },
             .kqueue_multiplex => {
+                if (self.kqueue_multiplex.wakeup_needed)
+                    return;
                 self.kqueue_multiplex.wakeup_needed = true;
             },
-        };
+        }
+        self.armWakeup();
     }
 
     fn armWakeup(self: Multiplexer) void {
