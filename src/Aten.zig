@@ -403,11 +403,7 @@ fn singleIOCycle(self: *Aten, lock: Action, unlock: Action) !void {
     };
     for (0..count) |i| {
         if (events[i] != &Multiplexer.TimerFdEvent) {
-            events[i].trigger() catch |err| {
-                TRACE("ATEN-LOOP-TRIGGER-FAIL UID={} ERR={}", //
-                    .{ self.uid, err });
-                return err;
-            };
+            events[i].trigger();
             TRACE("ATEN-LOOP-EXECUTE UID={} EVENT={}", //
                 .{ self.uid, events[i].uid });
         }
@@ -835,7 +831,7 @@ pub const Event = struct {
 
     /// Trigger an event. The associated callback action is guaranteed
     /// to be invoked subsequently at least once.
-    pub fn trigger(self: *Event) !void {
+    pub fn trigger(self: *Event) void {
         TRACE("ATEN-EVENT-TRIGGER UID={}", .{self.uid});
         switch (self.state) {
             .idle => {
