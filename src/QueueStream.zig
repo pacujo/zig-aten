@@ -27,31 +27,28 @@ const ConsumptionState = enum { open, closed };
 const Queue = std.DoublyLinkedList(ByteStream);
 
 fn notify(self: *QueueStream) void {
-    if (self.production_state == .open)
-        self.open.notifier.trigger();
+    self.consumption_state.open.notifier.trigger();
 }
 
 fn doRead(self: *QueueStream, buffer: []u8) !usize {
     while (self.queue.first) |first_node| {
         const substream = first_node.data;
-        const count = try substream.read(buffer);
+        const count = substream.read(buffer) catch |err| {
+            if (!self.consumption_state.open.head_subscribed) {
+                substream.subscribe(Action.make(self, notify));
+                self.consumption_state.open.head_subscribed = true;
+            }
+            return err;
+        };
         if (count > 0)
             return count;
         substream.close();
         _ = self.queue.popFirst();
         self.aten.dealloc(first_node);
-        self.open.head_subscribed = false;
+        self.consumption_state.open.head_subscribed = false;
     }
-    if (self.production_state == .open) {
-        if (self.queue.first) |first_node| {
-            if (!self.open.head_subscribed) {
-                const substream = first_node.data;
-                substream.subscribe(Action.make(self, notify));
-                self.open.head_subscribed = true;
-            }
-        }
+    if (self.production_state == .open)
         return error.EAGAIN;
-    }
     return 0;
 }
 
@@ -82,7 +79,7 @@ pub fn close(self: *QueueStream) void {
     TRACE("ATEN-QUEUESTREAM-CLOSE UID={} P-STATE={}", //
         .{ self.uid, self.production_state });
     self.flushQueue();
-    self.open.notifier.destroy();
+    self.consumption_state.open.notifier.destroy();
     self.consumption_state = .closed;
     if (self.production_state == .terminated) {
         self.aten.wound(self);
@@ -97,7 +94,7 @@ pub fn subscribe(self: *QueueStream, action: Action) void {
 pub fn make(aten: *Aten) *QueueStream {
     const self = aten.alloc(QueueStream);
     const probe = ByteStream.makeCallbackProbe(QueueStream);
-    const notifier = Event.make(self.aten, Action.make(self, probe));
+    const notifier = Event.make(aten, Action.make(self, probe));
     self.* = .{
         .aten = aten,
         .uid = r3.newUID(),
@@ -126,8 +123,8 @@ pub fn enqueue(self: *QueueStream, substream: ByteStream) void {
     TRACE("ATEN-QUEUESTREAM-ENQUEUE UID={} SUB={}", .{ self.uid, substream });
     if (self.consumption_state == .open) {
         if (self.queue.first.? == node) {
-            self.open.notifier.trigger();
-            self.open.subscribed = false;
+            self.consumption_state.open.notifier.trigger();
+            self.consumption_state.open.head_subscribed = false;
         }
     }
 }
@@ -139,8 +136,8 @@ pub fn push(self: *QueueStream, substream: ByteStream) void {
     self.queue.preend(node);
     TRACE("ATEN-QUEUESTREAM-PUSH UID={} SUB={}", .{ self.uid, substream });
     if (self.consumption_state == .open) {
-        self.open.notifier.trigger();
-        self.open.subscribed = false;
+        self.consumption_state.open.notifier.trigger();
+        self.consumption_state.open.head_subscribed = false;
     }
 }
 
@@ -169,11 +166,11 @@ pub fn terminate(self: *QueueStream) void {
     switch (self.consumption_state) {
         .open => {
             self.production_state = .terminated;
-            self.open.notifier.trigger();
+            self.consumption_state.open.notifier.trigger();
         },
         .closed => {
             self.production_state = .terminating;
-            self.aten.execute(Action.make(self, wrapUp));
+            _ = self.aten.execute(Action.make(self, wrapUp));
         },
     }
 }
