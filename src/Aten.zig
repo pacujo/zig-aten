@@ -151,9 +151,9 @@ fn earliestTimer(self: *Aten) ?*Timer {
                 self.allocator.destroy(immediate_node);
                 continue;
             }
-            if (Timer.compare({}, immediate, timed) == .lt) {
-                return immediate;
-            }
+            if (Timer.compare({}, immediate, timed) == .gt)
+                break;
+            return immediate;
         }
         return timed;
     }
@@ -335,8 +335,8 @@ fn takeImmediateAction(self: *Aten) ?Duration {
                     .{ self.uid, timer.expires });
                 return delay;
             }
-            TRACE("ATEN-LOOP-TIMEOUT UID={} ACT={}", //
-                .{ self.uid, timer.action });
+            TRACE("ATEN-LOOP-TIMEOUT SEQ-NO={} ACT={}", //
+                .{ timer.seq_no, timer.action });
             if (TRACE_ENABLED("ATEN-TIMER-BT")) {
                 if (timer.stack_trace) |stack_trace| {
                     TRACE("ATEN-TIMER-BT SEQ-NO={} BT={}", //
@@ -357,9 +357,7 @@ fn takeImmediateAction(self: *Aten) ?Duration {
 /// until `quitLoop` is called or an uncaught error takes place.
 pub fn loop(self: *Aten) !void {
     TRACE("ATEN-LOOP UID={}", .{self.uid});
-    self.quit = false;
-    while (!self.quit)
-        try self.singleIOCycle(Action.Null, Action.Null);
+    try self._loop(Action.Null, Action.Null, Action.Null);
 }
 
 /// The native `Aten` main loop with generic hooks for locking and
@@ -373,39 +371,43 @@ pub fn loop(self: *Aten) !void {
 pub fn loopProtected(self: *Aten, lock: Action, unlock: Action) !void {
     TRACE("ATEN-LOOP-PROTECTED UID={}", .{self.uid});
     try self.setUpWakeup();
-    self.quit = false;
-    while (!self.quit) {
-        self.armWakeup();
-        try self.singleIOCycle(lock, unlock);
-    }
+    try self._loop(lock, unlock, Action.make(self, armWakeup));
 }
 
-// The common innards of `loop` and `loopProtected`.
-fn singleIOCycle(self: *Aten, lock: Action, unlock: Action) !void {
-    const MaxIOBurst = 20;
-    const delay = self.takeImmediateAction();
-    if (self.quit) {
-        TRACE("ATEN-LOOP-QUIT UID={}", .{self.uid});
-        return;
-    }
-    TRACE("ATEN-LOOP-WAIT UID={} DELAY={?}", .{ self.uid, delay });
-    var events: [MaxIOBurst]*Event = undefined;
-    const count = blk: {
-        unlock.perform();
-        defer lock.perform();
-        break :blk self.multiplexer.waitForEvents(
-            &events,
-            delay,
-        ) catch |err| {
-            TRACE("ATEN-LOOP-FAIL UID={} ERR={}", .{ self.uid, err });
-            return err;
+fn _loop(
+    self: *Aten,
+    lock: Action,
+    unlock: Action,
+    rearm: Action,
+) !void {
+    self.quit = false;
+    while (!self.quit) {
+        const MaxIOBurst = 20;
+        const delay = self.takeImmediateAction();
+        if (self.quit) {
+            TRACE("ATEN-LOOP-QUIT UID={}", .{self.uid});
+            return;
+        }
+        TRACE("ATEN-LOOP-WAIT UID={} DELAY={?}", .{ self.uid, delay });
+        var events: [MaxIOBurst]*Event = undefined;
+        const count = blk: {
+            unlock.perform();
+            defer lock.perform();
+            break :blk self.multiplexer.waitForEvents(
+                &events,
+                delay,
+            ) catch |err| {
+                TRACE("ATEN-LOOP-FAIL UID={} ERR={}", .{ self.uid, err });
+                return err;
+            };
         };
-    };
-    for (0..count) |i| {
-        if (events[i] != &Multiplexer.TimerFdEvent) {
-            events[i].trigger();
-            TRACE("ATEN-LOOP-EXECUTE UID={} EVENT={}", //
-                .{ self.uid, events[i].uid });
+        rearm.perform();
+        for (0..count) |i| {
+            if (events[i] != &Multiplexer.TimerFdEvent) {
+                events[i].trigger();
+                TRACE("ATEN-LOOP-EXECUTE UID={} EVENT={}", //
+                    .{ self.uid, events[i].uid });
+            }
         }
     }
 }
@@ -416,11 +418,6 @@ fn singleIOCycle(self: *Aten, lock: Action, unlock: Action) !void {
 /// the user has previously run into `error.EAGAIN` or
 /// `error.EINPROGRESS`. A callback can also be invoked spuriously.
 pub fn register(self: *Aten, fd: fd_t, action: Action) !void {
-    nonblock(fd) catch |err| {
-        TRACE("ATEN-REGISTER-NONBLOCK-FAIL UID={} FD={} ACT={} ERR={}", //
-            .{ self.uid, fd, action, err });
-        return err;
-    };
     const event = Event.make(self, action);
     errdefer event.destroy();
     self.multiplexer.register(fd, event) catch |err| {
@@ -493,6 +490,19 @@ pub fn unregister(self: *Aten, fd: fd_t) !void {
     TRACE("ATEN-UNREGISTER UID={} FD={}", .{ self.uid, fd });
 }
 
+fn setUpWakeup(self: *Aten) !void {
+    self.multiplexer.setUpWakeup() catch |err| {
+        TRACE("ATEN-SET-UP-WAKEUP-FAIL UID={} ERR={}", .{ self.uid, err });
+        return err;
+    };
+    TRACE("ATEN-SET-UP-WAKEUP UID={}", .{self.uid});
+}
+
+fn armWakeup(self: *Aten) void {
+    self.multiplexer.armWakeup();
+    TRACE("ATEN-ARM-WAKEUP UID={}", .{self.uid});
+}
+
 // Wake up the (native or foreign) main loop from any thread.
 fn wakeUp(self: *Aten) void {
     TRACE("ATEN-WAKE-UP UID={}", .{self.uid});
@@ -528,6 +538,7 @@ pub const os = switch (@import("builtin").os.tag) {
         const CLOCK = linux.CLOCK;
         const timespec = linux.timespec;
         const itimerspec = linux.itimerspec;
+        const timerfd_create = linux.timerfd_create;
         const timerfd_settime = linux.timerfd_settime;
         const TFD = linux.TFD;
     },
@@ -889,7 +900,7 @@ const MultiplexMechanism = enum {
 // multiplexing and weake-up mechanisms for an `Aten` object.
 const Multiplexer = union(MultiplexMechanism) {
     pub const choice = MultiplexMechanism.choice();
-    const TimerFdEvent: Event = undefined; // a dummy sentinel
+    var TimerFdEvent: Event = undefined; // a dummy sentinel
 
     epoll_timerfd_multiplex: struct {
         epollfd: fd_t,
@@ -1044,6 +1055,7 @@ const Multiplexer = union(MultiplexMechanism) {
     }
 
     fn register(self: Multiplexer, fd: fd_t, event: *Event) !void {
+        try nonblock(fd);
         switch (choice) {
             .epoll_timerfd_multiplex, .epoll_pipe_multiplex => {
                 const triggers = os.EPOLL.IN | os.EPOLL.OUT | os.EPOLL.ET;
@@ -1157,6 +1169,46 @@ const Multiplexer = union(MultiplexMechanism) {
             .epoll_pipe_multiplex => self.epoll_pipe_multiplex.epollfd,
             .kqueue_multiplex => self.kqueue_multiplex.kqueuefd,
         };
+    }
+
+    fn setUpWakeup(self: *Multiplexer) !void {
+        return switch (choice) {
+            .epoll_timerfd_multiplex => {
+                if (self.epoll_timerfd_multiplex.timerfd != null)
+                    return;
+                const timerfd = try fdSyscall(
+                    os.timerfd_create(os.CLOCK.MONOTONIC, .{ .CLOEXEC = true }),
+                );
+                self.epoll_timerfd_multiplex.timerfd = timerfd;
+                try self.register(timerfd, &TimerFdEvent);
+            },
+            .epoll_pipe_multiplex => {
+                if (self.epoll_pipe_multiplex.wakeup_writefd != null)
+                    return;
+                var fds: [2]fd_t = undefined;
+                try checkSyscall(&fds);
+                self.epoll_pipe_multiplex.wakeup_readfd = fds[0];
+                self.epoll_pipe_multiplex.wakeup_writefd = fds[1];
+                try nonblock(fds[1]);
+                self.armWakeup();
+                try self.register(fds[1], &TimerFdEvent);
+            },
+            .kqueue_multiplex => {
+                self.kqueue_multiplex.wakeup_needed = true;
+            },
+        };
+    }
+
+    fn armWakeup(self: Multiplexer) void {
+        const readfd = switch (choice) {
+            .epoll_timerfd_multiplex => self.epoll_timerfd_multiplex.timerfd,
+            .epoll_pipe_multiplex => self.epoll_pipe_multiplex.wakeup_readfd,
+            .kqueue_multiplex => null,
+        };
+        if (readfd) |fd| {
+            var buffer: [1024]u8 = undefined;
+            while (read(fd, &buffer) catch return > 0) {}
+        }
     }
 
     fn wakeUp(self: Multiplexer) void {
