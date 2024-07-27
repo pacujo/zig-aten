@@ -30,7 +30,7 @@ pub fn close(self: *BlobStream) void {
     TRACE("ATEN-BLOBSTREAM-CLOSE UID={}", .{self.uid});
     std.debug.assert(self.state != .closed);
     self.state = .closed;
-    try self.aten.wound(self);
+    self.aten.wound(self);
 }
 
 pub fn subscribe(self: *BlobStream, action: Action) void {
