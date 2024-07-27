@@ -33,6 +33,11 @@ recent: PointInTime,
 mach_clock: if (os.tag == .macos) os.clock_serv_t else void,
 
 const Aten = @This();
+const Multiplexer = switch (os.tag) {
+    .linux => TimerFdMultiplexer,
+    // .linux => PipeMultiplexer, // if timerfd is not available
+    else => KqueueMultiplexer,
+};
 
 /// Create an `Aten` object. Typically, an `Aten` application has a
 /// single `Aten` object.
@@ -286,7 +291,6 @@ pub fn poll(self: *Aten) !?PointInTime {
 /// The return value does not require the foreign main loop to wake up
 /// at a particular time but can simply monitor `getFd()`.
 pub fn poll2(self: *Aten) !void {
-    std.debug.assert(self.multiplexer.choice == .epoll_timerfd_multiplex);
     const nextTimeout = try self.poll();
     std.debug.assert(nextTimeout == null);
 }
@@ -401,7 +405,7 @@ fn _loop(
         };
         rearm.perform();
         for (0..count) |i| {
-            if (events[i] != &Multiplexer.TimerFdEvent) {
+            if (events[i] != &SentinelEvent) {
                 events[i].trigger();
                 TRACE("ATEN-LOOP-EXECUTE UID={} EVENT={}", //
                     .{ self.uid, events[i].uid });
@@ -527,6 +531,7 @@ pub const os = switch (@import("builtin").os.tag) {
         const FD_CLOEXEC = linux.FD_CLOEXEC;
         const read = linux.read;
         const write = linux.write;
+        const pipe = linux.pipe;
         const epoll_create1 = linux.epoll_create1;
         const epoll_ctl = linux.epoll_ctl;
         const epoll_wait = linux.epoll_wait;
@@ -881,124 +886,285 @@ const RegistrationMap = std.AutoHashMap(fd_t, *Event);
 /// The file descriptor type.
 pub const fd_t = os.fd_t;
 
-// A `Multiplexer` encapsulates the operating-system-specific
-// multiplexing and weake-up mechanisms for an `Aten` object.
-const Multiplexer = union(MultiplexMechanism) {
-    const MultiplexMechanism = enum {
-        epoll_timerfd_multiplex, // Linux with timerfd
-        epoll_pipe_multiplex, // Linux without timerfd
-        kqueue_multiplex, // BSD
-    };
+var SentinelEvent: Event = undefined; // a dummy sentinel
 
-    const choice: MultiplexMechanism = switch (os.tag) {
-        .linux => .epoll_timerfd_multiplex,
-        else => .kqueue_multiplex,
-    };
-    var TimerFdEvent: Event = undefined; // a dummy sentinel
-
-    epoll_timerfd_multiplex: struct {
-        epollfd: fd_t,
-        // A timerfd is set up only if needed (multithreaded or
-        // foreign main loop).
-        timerfd: ?fd_t = null,
-    },
-    epoll_pipe_multiplex: struct {
-        epollfd: fd_t,
-        wakeup_readfd: ?fd_t = null, // set up only if needed
-        wakeup_writefd: ?fd_t = null, // set up only if needed
-    },
-    kqueue_multiplex: struct {
-        kqueuefd: fd_t,
-        wakeup_needed: bool = false,
-    },
-
-    fn make() !Multiplexer {
-        switch (choice) {
-            .epoll_timerfd_multiplex => {
-                const epollfd =
-                    try fdSyscall(os.epoll_create1(os.EPOLL.CLOEXEC));
-                return Multiplexer{
-                    .epoll_timerfd_multiplex = .{ .epollfd = epollfd },
-                };
-            },
-            .epoll_pipe_multiplex => {
-                const epollfd =
-                    try fdSyscall(os.epoll_create1(os.EPOLL.CLOEXEC));
-                return Multiplexer{
-                    .epoll_pipe_multiplex = .{ .epollfd = epollfd },
-                };
-            },
-            .kqueue_multiplex => {
-                const kqueuefd = try fdSyscall(os.kqueue());
-                try cloexec(kqueuefd);
-                return Multiplexer{
-                    .epoll_kqueue_multiplex = .{ .kqueuefd = kqueuefd },
-                };
-            },
-        }
+fn epollWaitForEvents(
+    epollfd: fd_t,
+    events: []*Event,
+    delay: ?Duration,
+) !usize {
+    const MaxEvents = 200;
+    const wish = @min(MaxEvents, events.len);
+    var epoll_events: [MaxEvents]os.epoll_event = undefined;
+    const count = try checkSyscall(
+        os.epoll_wait(
+            epollfd,
+            &epoll_events,
+            wish,
+            Duration.toMilliseconds(delay),
+        ),
+    );
+    for (0..count) |i| {
+        events[i] = @ptrFromInt(epoll_events[i].data.ptr);
     }
+    return count;
+}
 
-    fn close_opt_fd(opt_fd: ?fd_t) void {
-        if (opt_fd) |fd|
-            doSyscall(os.close(fd)) catch unreachable;
+fn epollRegister(
+    epollfd: fd_t,
+    op: u32,
+    fd: fd_t,
+    event: *Event,
+    triggers: u32,
+) !void {
+    var epoll_event = os.epoll_event{
+        .events = triggers,
+        .data = .{ .ptr = @intFromPtr(event) },
+    };
+    try doSyscall(os.epoll_ctl(epollfd, op, fd, &epoll_event));
+}
+
+const TimerFdMultiplexer = struct {
+    epollfd: fd_t,
+
+    // A timerfd is set up only if needed (multithreaded or foreign
+    // main loop).
+    timerfd: ?fd_t = null,
+
+    fn make() !TimerFdMultiplexer {
+        const epollfd = try fdSyscall(os.epoll_create1(os.EPOLL.CLOEXEC));
+        return TimerFdMultiplexer{ .epollfd = epollfd };
     }
 
     fn waitForEvents(
-        self: Multiplexer,
+        self: TimerFdMultiplexer,
+        events: []*Event,
+        delay: ?Duration,
+    ) !usize {
+        return try epollWaitForEvents(self.getFd(), events, delay);
+    }
+
+    fn register(self: TimerFdMultiplexer, fd: fd_t, event: *Event) !void {
+        try nonblock(fd);
+        const triggers = os.EPOLL.IN | os.EPOLL.OUT | os.EPOLL.ET;
+        try epollRegister(self.getFd(), os.EPOLL.CTL_ADD, fd, event, triggers);
+    }
+
+    fn registerOldSchool(
+        self: TimerFdMultiplexer,
+        fd: fd_t,
+        event: *Event,
+    ) !void {
+        try epollRegister(self.getFd(), os.EPOLL.CTL_ADD, fd, event, os.EPOLLIN);
+    }
+
+    fn modifyOldSchool(
+        self: TimerFdMultiplexer,
+        fd: fd_t,
+        event: *Event,
+        readable: bool,
+        writable: bool,
+    ) !void {
+        const triggers =
+            (if (readable) os.EPOLLIN else 0) |
+            (if (writable) os.EPOLLOUT else 0);
+        try epollRegister(self.getFd(), os.EPOLL.CTL_MOD, fd, event, triggers);
+    }
+
+    fn unregister(self: TimerFdMultiplexer, fd: fd_t) !void {
+        try doSyscall(os.epoll_ctl(self.getFd(), os.EPOLL.CTL_DEL, fd, null));
+    }
+
+    fn close(self: TimerFdMultiplexer) void {
+        if (self.timerfd) |timerfd| {
+            self.unregister(timerfd) catch unreachable;
+        }
+        close_opt_fd(self.epollfd);
+        close_opt_fd(self.timerfd);
+    }
+
+    fn getFd(self: TimerFdMultiplexer) fd_t {
+        return self.epollfd;
+    }
+
+    fn setUpWakeup(self: *TimerFdMultiplexer) !void {
+        if (self.timerfd != null)
+            return;
+        const timerfd = try fdSyscall(
+            os.timerfd_create(os.CLOCK.MONOTONIC, .{ .CLOEXEC = true }),
+        );
+        self.timerfd = timerfd;
+        try self.register(timerfd, &SentinelEvent);
+        self.armWakeup();
+    }
+
+    fn armWakeup(self: TimerFdMultiplexer) void {
+        if (self.timerfd) |fd| {
+            var buffer: [1024]u8 = undefined;
+            while (read(fd, &buffer) catch return > 0) {}
+        }
+    }
+
+    fn wakeUp(self: TimerFdMultiplexer) void {
+        if (self.timerfd) |timerfd| {
+            // in the past but not zero
+            const immediate = os.itimerspec{
+                .it_interval = undefined,
+                .it_value = .{ .tv_sec = 0, .tv_nsec = 1 },
+            };
+            doSyscall(os.timerfd_settime(
+                timerfd,
+                os.TFD.TIMER{ .ABSTIME = true },
+                &immediate,
+                null,
+            )) catch unreachable;
+        }
+    }
+
+    fn cancelWakeup(self: TimerFdMultiplexer) void {
+        if (self.timerfd) |timerfd| {
+            const never = os.itimerspec{
+                .it_interval = undefined,
+                .it_value = .{ .tv_sec = 0, .tv_nsec = 0 },
+            };
+            doSyscall(os.timerfd_settime(
+                timerfd,
+                os.TFD.TIMER{ .ABSTIME = true },
+                &never,
+                null,
+            )) catch unreachable;
+        }
+    }
+};
+
+const PipeMultiplexer = struct {
+    epollfd: fd_t,
+    wakeup_readfd: ?fd_t = null, // set up only if needed
+    wakeup_writefd: ?fd_t = null, // set up only if needed
+
+    fn make() !PipeMultiplexer {
+        const epollfd = try fdSyscall(os.epoll_create1(os.EPOLL.CLOEXEC));
+        return PipeMultiplexer{ .epollfd = epollfd };
+    }
+
+    fn waitForEvents(
+        self: PipeMultiplexer,
+        events: []*Event,
+        delay: ?Duration,
+    ) !usize {
+        return try epollWaitForEvents(self.getFd(), events, delay);
+    }
+
+    fn register(self: PipeMultiplexer, fd: fd_t, event: *Event) !void {
+        try nonblock(fd);
+        const triggers = os.EPOLL.IN | os.EPOLL.OUT | os.EPOLL.ET;
+        try epollRegister(self.getFd(), os.EPOLL.CTL_ADD, fd, event, triggers);
+    }
+
+    fn registerOldSchool(self: PipeMultiplexer, fd: fd_t, event: *Event) !void {
+        try epollRegister(self.getFd(), os.EPOLL.CTL_ADD, fd, event, os.EPOLLIN);
+    }
+
+    fn modifyOldSchool(
+        self: PipeMultiplexer,
+        fd: fd_t,
+        event: *Event,
+        readable: bool,
+        writable: bool,
+    ) !void {
+        const triggers =
+            (if (readable) os.EPOLLIN else 0) |
+            (if (writable) os.EPOLLOUT else 0);
+        try epollRegister(self.getFd(), os.EPOLL.CTL_MOD, fd, event, triggers);
+    }
+
+    fn unregister(self: PipeMultiplexer, fd: fd_t) !void {
+        try doSyscall(os.epoll_ctl(self.getFd(), os.EPOLL.CTL_DEL, fd, null));
+    }
+
+    fn close(self: PipeMultiplexer) void {
+        if (self.wakeup_readfd) |readfd| {
+            self.unregister(readfd) catch unreachable;
+        }
+        close_opt_fd(self.epollfd);
+        close_opt_fd(self.wakeup_readfd);
+        close_opt_fd(self.wakeup_writefd);
+    }
+
+    fn getFd(self: PipeMultiplexer) fd_t {
+        return self.epollfd;
+    }
+
+    fn setUpWakeup(self: *PipeMultiplexer) !void {
+        if (self.wakeup_writefd != null)
+            return;
+        var fds: [2]fd_t = undefined;
+        try doSyscall(os.pipe(&fds));
+        self.wakeup_readfd = fds[0];
+        self.wakeup_writefd = fds[1];
+        try self.register(fds[0], &SentinelEvent);
+        try nonblock(fds[1]);
+        self.armWakeup();
+    }
+
+    fn armWakeup(self: PipeMultiplexer) void {
+        if (self.wakeup_readfd) |fd| {
+            var buffer: [1024]u8 = undefined;
+            while (read(fd, &buffer) catch return > 0) {}
+        }
+    }
+
+    fn wakeUp(self: PipeMultiplexer) void {
+        const byte = [1]u8{0};
+        if (self.wakeup_writefd) |writefd| {
+            doSyscall(os.write(writefd, &byte, 1)) catch |err| {
+                std.debug.assert(err == error.EAGAIN);
+            };
+        }
+    }
+
+    fn cancelWakeup(self: PipeMultiplexer) void {
+        _ = self;
+    }
+};
+
+// KqueueMultiplexer has not yet been tested at all. It may not even
+// compile.
+const KqueueMultiplexer = struct {
+    kqueuefd: fd_t,
+    wakeup_needed: bool = false,
+
+    fn make() !KqueueMultiplexer {
+        const kqueuefd = try fdSyscall(os.kqueue());
+        try cloexec(kqueuefd);
+        return KqueueMultiplexer{ .kqueuefd = kqueuefd };
+    }
+
+    fn waitForEvents(
+        self: KqueueMultiplexer,
         events: []*Event,
         delay: ?Duration,
     ) !usize {
         const MaxEvents = 200;
         const wish = @min(MaxEvents, events.len);
-        switch (choice) {
-            .epoll_timerfd_multiplex, .epoll_pipe_multiplex => {
-                var epoll_events: [MaxEvents]os.epoll_event = undefined;
-                const count = try checkSyscall(
-                    os.epoll_wait(
-                        self.getFd(),
-                        &epoll_events,
-                        wish,
-                        Duration.toMilliseconds(delay),
-                    ),
-                );
-                for (0..count) |i|
-                    events[i] = @ptrFromInt(epoll_events[i].data.ptr);
-                return count;
-            },
-            .kqueue_multiplex => {
-                var kevents: [MaxEvents]os.Kevent = undefined;
-                const wait = Duration.toTimespec(delay);
-                const count = try checkSyscall(os.kevent(
-                    self.getFd(),
-                    &kevents, // dummy
-                    0,
-                    &kevents,
-                    wish,
-                    &wait,
-                ));
-                for (0..count) |i|
-                    events[i] = @ptrCast(kevents[i].udata);
-                return count;
-            },
+        var kevents: [MaxEvents]os.Kevent = undefined;
+        const wait = Duration.toTimespec(delay);
+        const count = try checkSyscall(os.kevent(
+            self.getFd(),
+            &kevents, // dummy
+            0,
+            &kevents,
+            wish,
+            &wait,
+        ));
+        for (0..count) |i| {
+            events[i] = @ptrCast(kevents[i].udata);
         }
+        return count;
     }
 
-    fn registerWithEpoll(
-        self: Multiplexer,
-        op: u32,
-        fd: fd_t,
-        event: *Event,
-        triggers: u32,
-    ) !void {
-        var epoll_event = os.epoll_event{
-            .events = triggers,
-            .data = .{ .ptr = @intFromPtr(event) },
-        };
-        try doSyscall(os.epoll_ctl(self.getFd(), op, fd, &epoll_event));
-    }
-
-    fn registerWithKqueue(
-        self: Multiplexer,
+    fn kqueueRegister(
+        self: KqueueMultiplexer,
         fd: fd_t,
         event: *Event,
         read_flags: u16,
@@ -1034,237 +1200,87 @@ const Multiplexer = union(MultiplexMechanism) {
         );
     }
 
-    fn register(self: Multiplexer, fd: fd_t, event: *Event) !void {
+    fn register(self: KqueueMultiplexer, fd: fd_t, event: *Event) !void {
         try nonblock(fd);
-        switch (choice) {
-            .epoll_timerfd_multiplex, .epoll_pipe_multiplex => {
-                const triggers = os.EPOLL.IN | os.EPOLL.OUT | os.EPOLL.ET;
-                try self.registerWithEpoll(
-                    os.EPOLL.CTL_ADD,
-                    fd,
-                    event,
-                    triggers,
-                );
-            },
-            .kqueue_multiplex => {
-                const read_flags = os.EV_ADD | os.EV_CLEAR;
-                const write_flags = os.EV_ADD | os.EV_CLEAR;
-                try self.registerWithKqueue(fd, event, read_flags, write_flags);
-            },
-        }
+        const read_flags = os.EV_ADD | os.EV_CLEAR;
+        const write_flags = os.EV_ADD | os.EV_CLEAR;
+        try self.kqueueRegister(fd, event, read_flags, write_flags);
     }
 
-    fn registerOldSchool(self: Multiplexer, fd: fd_t, event: *Event) !void {
-        switch (choice) {
-            .epoll_timerfd_multiplex, .epoll_pipe_multiplex => {
-                try self.registerWithEpoll(
-                    os.EPOLL.CTL_ADD,
-                    fd,
-                    event,
-                    os.EPOLLIN,
-                );
-            },
-            .kqueue_multiplex => {
-                const read_flags = os.EV_ADD;
-                const write_flags = os.EV_ADD | os.EV_DISABLE;
-                try self.registerWithKqueue(fd, event, read_flags, write_flags);
-            },
-        }
+    fn registerOldSchool(
+        self: KqueueMultiplexer,
+        fd: fd_t,
+        event: *Event,
+    ) !void {
+        const read_flags = os.EV_ADD;
+        const write_flags = os.EV_ADD | os.EV_DISABLE;
+        try self.kqueueRegister(fd, event, read_flags, write_flags);
     }
 
     fn modifyOldSchool(
-        self: Multiplexer,
+        self: KqueueMultiplexer,
         fd: fd_t,
         event: *Event,
         readable: bool,
         writable: bool,
     ) !void {
-        switch (choice) {
-            .epoll_timerfd_multiplex, .epoll_pipe_multiplex => {
-                const triggers =
-                    (if (readable) os.EPOLLIN else 0) |
-                    (if (writable) os.EPOLLOUT else 0);
-                try self.registerWithEpoll(
-                    os.EPOLL.CTL_MOD,
-                    fd,
-                    event,
-                    triggers,
-                );
-            },
-            .kqueue_multiplex => {
-                const read_flags = if (readable) os.EV_ENABLE else os.DISABLE;
-                const write_flags = if (writable) os.EV_ENABLE else os.DISABLE;
-                try self.registerWithKqueue(fd, event, read_flags, write_flags);
-            },
-        }
+        const read_flags = if (readable) os.EV_ENABLE else os.DISABLE;
+        const write_flags = if (writable) os.EV_ENABLE else os.DISABLE;
+        try self.kqueueRegister(fd, event, read_flags, write_flags);
     }
 
-    fn unregister(self: Multiplexer, fd: fd_t) !void {
-        switch (choice) {
-            .epoll_timerfd_multiplex, .epoll_pipe_multiplex => {
-                try doSyscall(
-                    os.epoll_ctl(self.getFd(), os.EPOLL.CTL_DEL, fd, null),
-                );
-            },
-            .kqueue_multiplex => {
-                const dummyEvent: Event = undefined;
-                const read_flags = os.EV_DELETE;
-                const write_flags = os.EV_DELETE;
-                try self.registerWithKqueue(
-                    fd,
-                    &dummyEvent,
-                    read_flags,
-                    write_flags,
-                );
-            },
-        }
+    fn unregister(self: KqueueMultiplexer, fd: fd_t) !void {
+        const dummyEvent: Event = undefined;
+        const read_flags = os.EV_DELETE;
+        const write_flags = os.EV_DELETE;
+        try self.kqueueRegister(fd, &dummyEvent, read_flags, write_flags);
     }
 
-    fn close(self: Multiplexer) void {
-        switch (choice) {
-            .epoll_timerfd_multiplex => {
-                if (self.epoll_timerfd_multiplex.timerfd) |timerfd| {
-                    self.unregister(timerfd) catch unreachable;
-                }
-                close_opt_fd(self.epoll_timerfd_multiplex.epollfd);
-                close_opt_fd(self.epoll_timerfd_multiplex.timerfd);
-            },
-            .epoll_pipe_multiplex => {
-                if (self.epoll_pipe_multiplex.wakeup_readfd) |readfd| {
-                    self.unregister(readfd) catch unreachable;
-                }
-                close_opt_fd(self.epoll_pipe_multiplex.epollfd);
-                close_opt_fd(self.epoll_pipe_multiplex.wakeup_readfd);
-                close_opt_fd(self.epoll_pipe_multiplex.wakeup_writefd);
-            },
-            .kqueue_multiplex => {
-                close_opt_fd(self.kqueue_multiplex.kqueuefd);
-            },
-        }
+    fn close(self: KqueueMultiplexer) void {
+        close_opt_fd(self.kqueuefd);
     }
 
-    fn getFd(self: Multiplexer) fd_t {
-        return switch (choice) {
-            .epoll_timerfd_multiplex => self.epoll_timerfd_multiplex.epollfd,
-            .epoll_pipe_multiplex => self.epoll_pipe_multiplex.epollfd,
-            .kqueue_multiplex => self.kqueue_multiplex.kqueuefd,
-        };
+    fn getFd(self: KqueueMultiplexer) fd_t {
+        return self.kqueuefd;
     }
 
-    fn setUpWakeup(self: *Multiplexer) !void {
-        switch (choice) {
-            .epoll_timerfd_multiplex => {
-                if (self.epoll_timerfd_multiplex.timerfd != null)
-                    return;
-                const timerfd = try fdSyscall(
-                    os.timerfd_create(os.CLOCK.MONOTONIC, .{ .CLOEXEC = true }),
-                );
-                self.epoll_timerfd_multiplex.timerfd = timerfd;
-                try self.register(timerfd, &TimerFdEvent);
-            },
-            .epoll_pipe_multiplex => {
-                if (self.epoll_pipe_multiplex.wakeup_writefd != null)
-                    return;
-                var fds: [2]fd_t = undefined;
-                try checkSyscall(&fds);
-                self.epoll_pipe_multiplex.wakeup_readfd = fds[0];
-                self.epoll_pipe_multiplex.wakeup_writefd = fds[1];
-                try nonblock(fds[1]);
-                try self.register(fds[1], &TimerFdEvent);
-            },
-            .kqueue_multiplex => {
-                if (self.kqueue_multiplex.wakeup_needed)
-                    return;
-                self.kqueue_multiplex.wakeup_needed = true;
-            },
-        }
+    fn setUpWakeup(self: *KqueueMultiplexer) !void {
+        if (self.wakeup_needed)
+            return;
+        self.wakeup_needed = true;
         self.armWakeup();
     }
 
-    fn armWakeup(self: Multiplexer) void {
-        const readfd = switch (choice) {
-            .epoll_timerfd_multiplex => self.epoll_timerfd_multiplex.timerfd,
-            .epoll_pipe_multiplex => self.epoll_pipe_multiplex.wakeup_readfd,
-            .kqueue_multiplex => null,
+    fn armWakeup(self: KqueueMultiplexer) void {
+        _ = self;
+    }
+
+    fn wakeUp(self: KqueueMultiplexer) void {
+        if (self.wakeup_needed)
+            self.setWakeupTime(0);
+    }
+
+    fn cancelWakeup(self: KqueueMultiplexer) void {
+        const changes = [1]os.Kevent{
+            .{
+                .ident = 0,
+                .filter = os.EVFILT_TIMER,
+                .flags = os.EV_DELETE,
+                .fflags = 0,
+                .data = 0,
+                .udata = null,
+            },
         };
-        if (readfd) |fd| {
-            var buffer: [1024]u8 = undefined;
-            while (read(fd, &buffer) catch return > 0) {}
-        }
-    }
-
-    fn wakeUp(self: Multiplexer) void {
-        switch (choice) {
-            .epoll_timerfd_multiplex => {
-                if (self.epoll_timerfd_multiplex.timerfd) |timerfd| {
-                    // in the past but not zero
-                    const immediate = os.itimerspec{
-                        .it_interval = undefined,
-                        .it_value = .{ .tv_sec = 0, .tv_nsec = 1 },
-                    };
-                    doSyscall(os.timerfd_settime(
-                        timerfd,
-                        os.TFD.TIMER{ .ABSTIME = true },
-                        &immediate,
-                        null,
-                    )) catch unreachable;
-                }
-            },
-            .epoll_pipe_multiplex => {
-                const byte = [1]u8{0};
-                if (self.epoll_pipe_multiplex.wakeup_writefd) |writefd| {
-                    doSyscall(os.write(writefd, &byte, 1)) catch |err| {
-                        std.debug.assert(err == error.EAGAIN);
-                    };
-                }
-            },
-            .kqueue_multiplex => {
-                if (self.kqueue_multiplex.wakeup_needed)
-                    self.setWakeupTime(0);
-            },
-        }
-    }
-
-    fn cancelWakeup(self: Multiplexer) void {
-        switch (choice) {
-            .epoll_timerfd_multiplex => {
-                if (self.epoll_timerfd_multiplex.timerfd) |timerfd| {
-                    const never = os.itimerspec{
-                        .it_interval = undefined,
-                        .it_value = .{ .tv_sec = 0, .tv_nsec = 0 },
-                    };
-                    doSyscall(os.timerfd_settime(
-                        timerfd,
-                        os.TFD.TIMER{ .ABSTIME = true },
-                        &never,
-                        null,
-                    )) catch unreachable;
-                }
-            },
-            .epoll_pipe_multiplex => {},
-            .kqueue_multiplex => {
-                const changes = [1]os.Kevent{
-                    .{
-                        .ident = 0,
-                        .filter = os.EVFILT_TIMER,
-                        .flags = os.EV_DELETE,
-                        .fflags = 0,
-                        .data = 0,
-                        .udata = null,
-                    },
-                };
-                try os.checkSyscall(
-                    os.kevent(
-                        self.getFd(),
-                        &changes,
-                        1,
-                        &changes, // dummy
-                        0,
-                        null,
-                    ),
-                );
-            },
-        }
+        try os.checkSyscall(
+            os.kevent(
+                self.getFd(),
+                &changes,
+                1,
+                &changes, // dummy
+                0,
+                null,
+            ),
+        );
     }
 };
 
@@ -1307,6 +1323,11 @@ pub fn read(fd: fd_t, buffer: []u8) !usize {
 /// The `close` system call of the operating system.
 pub fn close(fd: fd_t) void {
     doSyscall(os.close(fd)) catch unreachable;
+}
+
+fn close_opt_fd(opt_fd: ?fd_t) void {
+    if (opt_fd) |fd|
+        doSyscall(os.close(fd)) catch unreachable;
 }
 
 // Turn on the `FD_CLOEXEC` flag of the file descriptor.
