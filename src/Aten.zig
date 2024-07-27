@@ -7,8 +7,7 @@
 //! `Aten`'s philosophy is not to have writers; instead of A writing
 //! to B, B reads from A.
 //!
-//! `Aten` assumes memory allocation always succeeds and panics (with
-//! `@panic`) if that turns out not to be the case. `Aten` does not
+//! `Aten` assumes memory allocation always succeeds. `Aten` does not
 //! have built-in thread-safety but offers the necessary locking hooks
 //! to work with multithreading.
 //!
@@ -39,14 +38,13 @@ const Aten = @This();
 /// single `Aten` object.
 ///
 /// Internally, `Aten` uses the given allocator extensively and
-/// assumes memory allocation never fails (an error leads to
-/// `@panic`).
+/// assumes memory allocation never fails.
 ///
 /// On Linux, `epoll` is used for multiplexing. On BSD, `kqueue` is
 /// used.
 pub fn create(allocator: std.mem.Allocator) !*Aten {
     const multiplexer = try Multiplexer.make();
-    const aten = allocator.create(Aten) catch @panic("Aten.create failed");
+    const aten = allocator.create(Aten) catch unreachable;
     if (os.tag == .macos) {
         os.host_get_clock_service(
             os.mach_host_self(),
@@ -83,7 +81,7 @@ pub fn destroy(self: *Aten) void {
         var it = self.registrations.iterator();
         if (it.next()) |entry| {
             const fd = entry.key_ptr.*;
-            self.unregister(fd) catch @panic("Aten.destroy failed"); // TBD
+            self.unregister(fd) catch unreachable; // TBD
         } else break;
     }
     self.registrations.deinit();
@@ -97,7 +95,7 @@ pub fn destroy(self: *Aten) void {
 /// Allocate memory for the given object type using the `Aten`
 /// object's allocator. The allocation is assumed never to fail.
 pub fn alloc(self: *Aten, comptime T: type) *T {
-    return self.allocator.create(T) catch @panic("Aten.alloc failed");
+    return self.allocator.create(T) catch unreachable;
 }
 
 /// Free an object allocated with `alloc`.
@@ -107,7 +105,7 @@ pub fn dealloc(self: *Aten, object: anytype) void {
 
 /// Allocate and make a copy of a block of bytes.
 pub fn dupe(self: *Aten, orig: []const u8) []u8 {
-    return self.allocator.dupe(u8, orig) catch @panic("Aten.dupe failed");
+    return self.allocator.dupe(u8, orig) catch unreachable;
 }
 
 /// Return the current point in time, which can be assumed to grow
@@ -179,7 +177,7 @@ pub fn startTimer(
     action: Action,
 ) *Timer {
     const timer = Timer.make(self, expires, action);
-    self.timers.add(timer) catch @panic("Aten.startTimer failed");
+    self.timers.add(timer) catch unreachable;
     self.wakeUp();
     TRACE("ATEN-TIMER-START SEQ-NO={} ATEN={} EXPIRES={} ACT={}", //
         .{ timer.seq_no, self.uid, expires, action });
