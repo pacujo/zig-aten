@@ -883,23 +883,19 @@ const RegistrationMap = std.AutoHashMap(fd_t, *Event);
 /// The file descriptor type.
 pub const fd_t = os.fd_t;
 
-const MultiplexMechanism = enum {
-    epoll_timerfd_multiplex, // Linux with timerfd
-    epoll_pipe_multiplex, // Linux without timerfd
-    kqueue_multiplex, // BSD
-
-    fn choice() MultiplexMechanism {
-        return switch (os.tag) {
-            .linux => .epoll_timerfd_multiplex,
-            else => .kqueue_multiplex,
-        };
-    }
-};
-
 // A `Multiplexer` encapsulates the operating-system-specific
 // multiplexing and weake-up mechanisms for an `Aten` object.
 const Multiplexer = union(MultiplexMechanism) {
-    pub const choice = MultiplexMechanism.choice();
+    const MultiplexMechanism = enum {
+        epoll_timerfd_multiplex, // Linux with timerfd
+        epoll_pipe_multiplex, // Linux without timerfd
+        kqueue_multiplex, // BSD
+    };
+
+    const choice: MultiplexMechanism = switch (os.tag) {
+        .linux => .epoll_timerfd_multiplex,
+        else => .kqueue_multiplex,
+    };
     var TimerFdEvent: Event = undefined; // a dummy sentinel
 
     epoll_timerfd_multiplex: struct {
@@ -921,36 +917,22 @@ const Multiplexer = union(MultiplexMechanism) {
     fn make() !Multiplexer {
         switch (choice) {
             .epoll_timerfd_multiplex => {
-                const epollfd = fdSyscall(
-                    os.epoll_create1(os.EPOLL.CLOEXEC),
-                ) catch |err| {
-                    TRACE("ATEN-EPOLL-CREATE-FAILED ERR={}", .{err});
-                    return err;
-                };
+                const epollfd =
+                    try fdSyscall(os.epoll_create1(os.EPOLL.CLOEXEC));
                 return Multiplexer{
                     .epoll_timerfd_multiplex = .{ .epollfd = epollfd },
                 };
             },
             .epoll_pipe_multiplex => {
-                const epollfd = fdSyscall(
-                    os.epoll_create1(os.EPOLL.CLOEXEC),
-                ) catch |err| {
-                    TRACE("ATEN-EPOLL-CREATE-FAILED ERR={}", .{err});
-                    return err;
-                };
+                const epollfd =
+                    try fdSyscall(os.epoll_create1(os.EPOLL.CLOEXEC));
                 return Multiplexer{
                     .epoll_pipe_multiplex = .{ .epollfd = epollfd },
                 };
             },
             .kqueue_multiplex => {
-                const kqueuefd = fdSyscall(os.kqueue()) catch |err| {
-                    TRACE("ATEN-KQUEUE-FAILED ERR={}", .{err});
-                    return err;
-                };
-                cloexec(kqueuefd) catch |err| {
-                    TRACE("ATEN-CLOEXEC-FAILED ERR={}", .{err});
-                    return err;
-                };
+                const kqueuefd = try fdSyscall(os.kqueue());
+                try cloexec(kqueuefd);
                 return Multiplexer{
                     .epoll_kqueue_multiplex = .{ .kqueuefd = kqueuefd },
                 };
