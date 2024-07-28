@@ -328,7 +328,7 @@ fn takeImmediateAction(self: *Aten) ?Duration {
     var i: u8 = MaxIOStarvation;
     while (!self.quit and i > 0) : (i -= 1) {
         if (self.earliestTimer()) |timer| {
-            const delay = timer.expires.sub(self.now());
+            const delay = timer.expires.diff(self.now());
             if (!delay.done()) {
                 TRACE("ATEN-LOOP-NEXT-TIMER UID={} EXPIRES={}", //
                     .{ self.uid, timer.expires });
@@ -644,7 +644,12 @@ pub const PointInTime = struct {
         return .{ .ns_since_epoch = self.ns_since_epoch +% udelta };
     }
 
-    pub fn sub(self: PointInTime, other: PointInTime) Duration {
+    pub fn sub(self: PointInTime, delta: Duration) PointInTime {
+        const udelta: u64 = @bitCast(delta.ns_delta);
+        return .{ .ns_since_epoch = self.ns_since_epoch -% udelta };
+    }
+
+    pub fn diff(self: PointInTime, other: PointInTime) Duration {
         const udelta: u64 = self.ns_since_epoch -% other.ns_since_epoch;
         return .{ .ns_delta = @bitCast(udelta) };
     }
@@ -1703,7 +1708,179 @@ pub const QueueStream = @import("QueueStream.zig");
 /// A byte stream that emits an unending sequence of zero bytes.
 pub const ZeroStream = @import("ZeroStream.zig");
 
-test "Testing testing" {
-    TRACE("TESTING", .{});
-    // try std.testing.expectEqualSlices(u8, "test", "test");
+fn testingAllocator() std.mem.Allocator {
+    const S = struct {
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        const allocator = gpa.allocator();
+    };
+    return S.allocator;
+}
+
+fn elapsed(start_instant: std.time.Instant, end_instant: std.time.Instant) f32 {
+    const nanoseconds: f32 = @floatFromInt(end_instant.since(start_instant));
+    return 1e-9 * nanoseconds;
+}
+
+test "Aten-immediate-quit" {
+    const test_name = r3.str(@src().fn_name);
+    TRACE("ATEN-TEST-BEGIN TEST={}", .{test_name});
+    defer TRACE("ATEN-TEST-END TEST={}", .{test_name});
+    errdefer TRACE("ATEN-TEST-FAIL TEST={}", .{test_name});
+    const start_instant = try std.time.Instant.now();
+
+    const TestApp = struct {
+        aten: *Aten,
+
+        const Self = @This();
+
+        fn run(self: *Self) !void {
+            _ = self.aten.execute(Action.make(self.aten, Aten.quitLoop));
+            try self.aten.loop();
+        }
+    };
+
+    const aten = try Aten.create(testingAllocator());
+    defer aten.destroy();
+    var app = TestApp{ .aten = aten };
+    try app.run();
+    const runtime = elapsed(start_instant, try std.time.Instant.now());
+    try std.testing.expectApproxEqRel(0.0, runtime, 0.5);
+}
+
+test "Aten-timed-quit" {
+    const test_name = r3.str(@src().fn_name);
+    TRACE("ATEN-TEST-BEGIN TEST={}", .{test_name});
+    defer TRACE("ATEN-TEST-END TEST={}", .{test_name});
+    errdefer TRACE("ATEN-TEST-FAIL TEST={}", .{test_name});
+    const start_instant = try std.time.Instant.now();
+
+    const TestApp = struct {
+        aten: *Aten,
+
+        const Self = @This();
+
+        fn run(self: *Self) !void {
+            _ = self.aten.startTimer(
+                self.aten.now().add(Duration.ms.mul(5_300)),
+                Action.make(self.aten, Aten.quitLoop),
+            );
+            try self.aten.loop();
+        }
+    };
+
+    const aten = try Aten.create(testingAllocator());
+    defer aten.destroy();
+    var app = TestApp{ .aten = aten };
+    try app.run();
+    const runtime = elapsed(start_instant, try std.time.Instant.now());
+    try std.testing.expectApproxEqRel(5.3, runtime, 0.5);
+}
+
+test "Aten-overdue-quit" {
+    const test_name = r3.str(@src().fn_name);
+    TRACE("ATEN-TEST-BEGIN TEST={}", .{test_name});
+    defer TRACE("ATEN-TEST-END TEST={}", .{test_name});
+    errdefer TRACE("ATEN-TEST-FAIL TEST={}", .{test_name});
+    const start_instant = try std.time.Instant.now();
+
+    const TestApp = struct {
+        aten: *Aten,
+
+        const Self = @This();
+
+        fn run(self: *Self) !void {
+            _ = self.aten.startTimer(
+                self.aten.now().sub(Duration.ms.mul(2_300)),
+                Action.make(self.aten, Aten.quitLoop),
+            );
+            try self.aten.loop();
+        }
+    };
+
+    const aten = try Aten.create(testingAllocator());
+    defer aten.destroy();
+    var app = TestApp{ .aten = aten };
+    try app.run();
+    const runtime = elapsed(start_instant, try std.time.Instant.now());
+    try std.testing.expectApproxEqRel(0.0, runtime, 0.5);
+}
+
+test "Aten-read-in-stream" {
+    const test_name = r3.str(@src().fn_name);
+    TRACE("ATEN-TEST-BEGIN TEST={}", .{test_name});
+    defer TRACE("ATEN-TEST-END TEST={}", .{test_name});
+    errdefer TRACE("ATEN-TEST-FAIL TEST={}", .{test_name});
+    const start_instant = try std.time.Instant.now();
+
+    const TestApp = struct {
+        aten: *Aten,
+        feed: ByteStream,
+        verdict: ?anyerror,
+
+        const Self = @This();
+
+        fn run(self: *Self) !void {
+            self.feed.subscribe(Action.make(self, probe));
+            _ = self.aten.execute(Action.make(self, probe));
+            _ = self.aten.startTimer(
+                self.aten.now().add(Duration.s.mul(30)),
+                Action.make(self, timedOut),
+            );
+            try self.aten.loop();
+        }
+
+        fn timedOut(self: *Self) void {
+            TRACE("ATEN-TEST-TIMEOUT", .{});
+            self.verdict = error.ETIMEDOUT;
+            self.aten.quitLoop();
+        }
+
+        fn probe(self: *Self) void {
+            var buffer: [100]u8 = undefined;
+            while (true) {
+                const count = self.feed.read(&buffer) catch |err| {
+                    if (err != error.EAGAIN) {
+                        TRACE("ATEN-TEST-PROBE-FAIL ERR={}", .{err});
+                        self.verdict = err;
+                        self.aten.quitLoop();
+                    }
+                    TRACE("ATEN-TEST-PROBE-AGAIN", .{});
+                    return;
+                };
+                if (count == 0) {
+                    TRACE("ATEN-TEST-PROBE-EOF", .{});
+                    self.aten.quitLoop();
+                    return;
+                }
+                TRACE("ATEN-TEST-PROBE-READ GOT={}", .{count});
+                TRACE("ATEN-TEST-PROBE-READ-DUMP TEXT={}", //
+                    .{r3.str(buffer[0..count])});
+            }
+        }
+    };
+
+    const aten = try Aten.create(testingAllocator());
+    defer aten.destroy();
+    const test_data = "Hello, world!";
+    const blob_stream = BlobStream.make(aten, test_data);
+    const pacer_stream = PacerStream.make(
+        aten,
+        ByteStream.from(blob_stream),
+        1,
+        1,
+        1,
+    );
+    defer pacer_stream.close();
+    var app = TestApp{
+        .aten = aten,
+        .feed = ByteStream.from(pacer_stream),
+        .verdict = null,
+    };
+    try app.run();
+    if (app.verdict) |err| {
+        return err;
+    }
+    const runtime = elapsed(start_instant, try std.time.Instant.now());
+    const expected_duration: f32 = @floatFromInt(test_data.len);
+    try std.testing.expectApproxEqRel(expected_duration, runtime, 0.5);
 }

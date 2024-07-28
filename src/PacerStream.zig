@@ -40,7 +40,7 @@ pub fn read(self: *PacerStream, buffer: []u8) !usize {
         self.retry_timer = null;
     }
     const t = self.aten.now();
-    const delta = t.sub(self.prev_t).to(Float);
+    const delta = t.diff(self.prev_t).to(Float);
     self.quota += delta * self.byterate;
     self.quota = @min(self.quota, self.max_burst);
     self.prev_t = t;
