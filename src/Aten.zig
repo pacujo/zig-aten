@@ -248,8 +248,11 @@ pub fn getFd(self: *Aten) fd_t {
 pub fn poll(self: *Aten) !?PointInTime {
     try self.setUpWakeup();
     self.armWakeup();
-    const events: [1]*Event = undefined;
-    const count = self.multiplexer.waitForEvents(events, 0) catch |err| {
+    var events: [1]*Event = undefined;
+    const count = self.multiplexer.waitForEvents(
+        &events,
+        Duration.zero,
+    ) catch |err| {
         TRACE("ATEN-POLL-FAIL UID={} ERR={}", .{ self.uid, err });
         return err;
     };
@@ -261,7 +264,7 @@ pub fn poll(self: *Aten) !?PointInTime {
     }
     TRACE("ATEN-POLL-SPURIOUS UID={}", .{self.uid});
     if (self.earliestTimer()) |timer| {
-        if (timer.expires > self.now()) {
+        if (timer.expires.order(self.now()) == .gt) {
             TRACE("ATEN-POLL-NEXT-TIMER UID={} EXPIRES={}", //
                 .{ self.uid, timer.expires });
             return self.scheduleWakeup(timer.expires);
@@ -306,13 +309,13 @@ pub fn quitLoop(self: *Aten) void {
 /// operation is time-limited.
 pub fn flush(self: *Aten, expires: PointInTime) !void {
     TRACE("ATEN-FLUSH UID={} EXPIRES={}", .{ self.uid, expires });
-    while (self.now() < expires) {
+    while (self.now().order(expires) == .lt) {
         const next_timeout = self.poll() catch |err| {
             TRACE("ATEN-FLUSH-FAIL UID={} ERR={}", .{ self.uid, err });
             return err;
         };
         if (next_timeout) |timeout| {
-            if (timeout <= self.now())
+            if (timeout.order(self.now()) != .gt)
                 continue;
         }
         TRACE("ATEN-FLUSHED UID={}", .{self.uid});
@@ -439,7 +442,7 @@ pub fn registerOldSchool(self: *Aten, fd: fd_t, action: Action) !void {
             .{ self.uid, fd, action, err });
         return err;
     };
-    const event = try Event.make(self, action);
+    const event = Event.make(self, action);
     errdefer event.destroy();
     self.multiplexer.registerOldSchool(fd, event) catch |err| {
         TRACE("ATEN-REGISTER-OLD-SCHOOL-FAIL UID={} FD={} ACT={} ERR={}", //
@@ -506,6 +509,12 @@ fn armWakeup(self: *Aten) void {
 fn wakeUp(self: *Aten) void {
     TRACE("ATEN-WAKE-UP UID={}", .{self.uid});
     self.multiplexer.wakeUp();
+}
+
+fn scheduleWakeup(self: *Aten, expires: PointInTime) ?PointInTime {
+    const target = self.multiplexer.scheduleWakeup(expires);
+    TRACE("ATEN-WAKE-UP UID={} TIME={?}", .{ self.uid, target });
+    return target;
 }
 
 fn cancelWakeup(self: *Aten) void {
@@ -601,7 +610,7 @@ pub const Action = struct {
 
 /// A black-box data type representing a point in time.
 pub const PointInTime = struct {
-    ns_since_epoch: u64,
+    ns_elapsed: u64,
 
     fn getMonotonicClock(hw_clock: clock_serv_t) PointInTime {
         switch (os.tag) {
@@ -609,7 +618,7 @@ pub const PointInTime = struct {
                 var t: os.timespec = undefined;
                 _ = os.clock_gettime(os.CLOCK.MONOTONIC, &t);
                 return .{
-                    .ns_since_epoch = @intCast(
+                    .ns_elapsed = @intCast(
                         t.tv_sec * 1_000_000_000 + t.tv_nsec,
                     ),
                 };
@@ -618,7 +627,7 @@ pub const PointInTime = struct {
                 var t: std.c.darwin.mach_timespec_t = undefined;
                 _ = std.c.darwin.clock_get_time(hw_clock, &t);
                 return .{
-                    .ns_since_epoch = t.tv_sec * 1_000_000_000 + t.tv_nsec,
+                    .ns_elapsed = t.tv_sec * 1_000_000_000 + t.tv_nsec,
                 };
             },
             else => unreachable,
@@ -634,28 +643,39 @@ pub const PointInTime = struct {
                 var t: os.timeval = undefined;
                 _ = os.gettimeofday(&t, 0);
                 const us = t.tv_sec * 1_000_000 + t.tv_usec;
-                return .{ .ns_since_epoch = us * 1_000 };
+                return .{ .ns_elapsed = us * 1_000 };
             },
         }
     }
 
     pub fn add(self: PointInTime, delta: Duration) PointInTime {
         const udelta: u64 = @bitCast(delta.ns_delta);
-        return .{ .ns_since_epoch = self.ns_since_epoch +% udelta };
+        return .{ .ns_elapsed = self.ns_elapsed +% udelta };
     }
 
     pub fn sub(self: PointInTime, delta: Duration) PointInTime {
         const udelta: u64 = @bitCast(delta.ns_delta);
-        return .{ .ns_since_epoch = self.ns_since_epoch -% udelta };
+        return .{ .ns_elapsed = self.ns_elapsed -% udelta };
     }
 
     pub fn diff(self: PointInTime, other: PointInTime) Duration {
-        const udelta: u64 = self.ns_since_epoch -% other.ns_since_epoch;
+        const udelta: u64 = self.ns_elapsed -% other.ns_elapsed;
         return .{ .ns_delta = @bitCast(udelta) };
     }
 
     pub fn order(self: PointInTime, other: PointInTime) std.math.Order {
-        return std.math.order(self.ns_since_epoch, other.ns_since_epoch);
+        return std.math.order(self.ns_elapsed, other.ns_elapsed);
+    }
+
+    /// Convert a duration to a `timespec` value or `null` to `null`.
+    pub fn toTimespec(self: PointInTime) os.timespec {
+        // timerfd would interpret an all-zero timespec as "never". We
+        // assert there's no risk of that:
+        std.debug.assert(self.ns_elapsed != 0);
+        return .{
+            .tv_sec = @intCast(@divFloor(self.ns_elapsed, 1_000_000_000)),
+            .tv_nsec = @intCast(@mod(self.ns_elapsed, 1_000_000_000)),
+        };
     }
 
     /// A representation of a `PointInTime` value.
@@ -666,8 +686,8 @@ pub const PointInTime = struct {
         writer: anytype,
     ) !void {
         try writer.print("{}.{:0>9}", .{
-            @divFloor(self.ns_since_epoch, 1_000_000_000),
-            @mod(self.ns_since_epoch, 1_000_000_000),
+            @divFloor(self.ns_elapsed, 1_000_000_000),
+            @mod(self.ns_elapsed, 1_000_000_000),
         });
     }
 };
@@ -747,7 +767,7 @@ pub const Duration = struct {
     }
 
     /// Convert a duration to a `timespec` value or `null` to `null`.
-    pub fn toTimespec(delay: ?Duration) ?*os.timespec {
+    pub fn toTimespec(delay: ?Duration) ?os.timespec {
         if (delay) |duration| {
             return .{
                 .tv_sec = @divFloor(duration.ns_delta, 1_000_000_000),
@@ -989,7 +1009,9 @@ const TimerFdMultiplexer = struct {
         fd: fd_t,
         event: *Event,
     ) !void {
-        try epollRegister(self.getFd(), os.EPOLL.CTL_ADD, fd, event, os.EPOLLIN);
+        try nonblock(fd);
+        const trigger = os.EPOLL.IN;
+        try epollRegister(self.getFd(), os.EPOLL.CTL_ADD, fd, event, trigger);
     }
 
     fn modifyOldSchool(
@@ -999,9 +1021,9 @@ const TimerFdMultiplexer = struct {
         readable: bool,
         writable: bool,
     ) !void {
-        const triggers =
-            (if (readable) os.EPOLLIN else 0) |
-            (if (writable) os.EPOLLOUT else 0);
+        var triggers: u32 = 0;
+        if (readable) triggers |= os.EPOLL.IN;
+        if (writable) triggers |= os.EPOLL.OUT;
         try epollRegister(self.getFd(), os.EPOLL.CTL_MOD, fd, event, triggers);
     }
 
@@ -1055,19 +1077,34 @@ const TimerFdMultiplexer = struct {
         }
     }
 
-    fn cancelWakeup(self: TimerFdMultiplexer) void {
+    fn setWakeupTime(self: TimerFdMultiplexer, target: os.itimerspec) void {
         if (self.timerfd) |timerfd| {
-            const never = os.itimerspec{
-                .it_interval = undefined,
-                .it_value = .{ .tv_sec = 0, .tv_nsec = 0 },
-            };
             doSyscall(os.timerfd_settime(
                 timerfd,
                 os.TFD.TIMER{ .ABSTIME = true },
-                &never,
+                &target,
                 null,
             )) catch unreachable;
         }
+    }
+
+    fn scheduleWakeup(
+        self: TimerFdMultiplexer,
+        expires: PointInTime,
+    ) ?PointInTime {
+        self.setWakeupTime(.{
+            .it_interval = undefined,
+            .it_value = expires.toTimespec(),
+        });
+        return null;
+    }
+
+    fn cancelWakeup(self: TimerFdMultiplexer) void {
+        const never = os.itimerspec{
+            .it_interval = undefined,
+            .it_value = .{ .tv_sec = 0, .tv_nsec = 0 },
+        };
+        self.setWakeupTime(never);
     }
 };
 
@@ -1096,6 +1133,7 @@ const PipeMultiplexer = struct {
     }
 
     fn registerOldSchool(self: PipeMultiplexer, fd: fd_t, event: *Event) !void {
+        try nonblock(fd);
         try epollRegister(self.getFd(), os.EPOLL.CTL_ADD, fd, event, os.EPOLLIN);
     }
 
@@ -1155,6 +1193,14 @@ const PipeMultiplexer = struct {
                 std.debug.assert(err == error.EAGAIN);
             };
         }
+    }
+
+    fn scheduleWakeup(
+        self: PipeMultiplexer,
+        expires: PointInTime,
+    ) ?PointInTime {
+        _ = self;
+        return expires;
     }
 
     fn cancelWakeup(self: PipeMultiplexer) void {
@@ -1246,6 +1292,7 @@ const KqueueMultiplexer = struct {
         fd: fd_t,
         event: *Event,
     ) !void {
+        try nonblock(fd);
         const read_flags = os.EV_ADD;
         const write_flags = os.EV_ADD | os.EV_DISABLE;
         try self.kqueueRegister(fd, event, read_flags, write_flags);
@@ -1294,6 +1341,40 @@ const KqueueMultiplexer = struct {
             self.setWakeupTime(0);
     }
 
+    fn setWakeupTime(self: KqueueMultiplexer, delay: Duration) void {
+        const changes = [1]os.Kevent{
+            .{
+                .ident = 0,
+                .filter = os.EVFILT_TIMER,
+                .flags = os.EV_ADD | os.EV_ENABLE | os.EV_ONESHOT,
+                .fflags = os.NOTE_NSECONDS,
+                .data = delay.ns_delta,
+                .udata = null,
+            },
+        };
+        os.checkSyscall(
+            os.kevent(
+                self.getFd(),
+                &changes,
+                1,
+                &changes, // dummy
+                0,
+                null,
+            ),
+        ) catch unreachable;
+    }
+
+    fn scheduleWakeup(
+        self: PipeMultiplexer,
+        expires: PointInTime,
+    ) ?PointInTime {
+        const delay = expires.sub(self.now());
+        self.setWakeupTime(
+            if (delay.order(Duration.zero) == .gt) delay else Duration.zero,
+        );
+        return null;
+    }
+
     fn cancelWakeup(self: KqueueMultiplexer) void {
         const changes = [1]os.Kevent{
             .{
@@ -1305,7 +1386,7 @@ const KqueueMultiplexer = struct {
                 .udata = null,
             },
         };
-        try os.checkSyscall(
+        os.checkSyscall(
             os.kevent(
                 self.getFd(),
                 &changes,
@@ -1314,7 +1395,7 @@ const KqueueMultiplexer = struct {
                 0,
                 null,
             ),
-        );
+        ) catch unreachable;
     }
 };
 
@@ -1708,7 +1789,7 @@ pub const QueueStream = @import("QueueStream.zig");
 /// A byte stream that emits an unending sequence of zero bytes.
 pub const ZeroStream = @import("ZeroStream.zig");
 
-fn testingAllocator() std.mem.Allocator {
+pub fn testingAllocator() std.mem.Allocator {
     const S = struct {
         var gpa = std.heap.GeneralPurposeAllocator(.{}){};
         const allocator = gpa.allocator();
@@ -1716,9 +1797,19 @@ fn testingAllocator() std.mem.Allocator {
     return S.allocator;
 }
 
-fn elapsed(start_instant: std.time.Instant, end_instant: std.time.Instant) f32 {
+pub fn elapsed(
+    start_instant: std.time.Instant,
+    end_instant: std.time.Instant,
+) f32 {
     const nanoseconds: f32 = @floatFromInt(end_instant.since(start_instant));
     return 1e-9 * nanoseconds;
+}
+
+test "Aten-initialize-tests" {
+    @import("std").testing.refAllDecls(@This());
+    const opt = @import("test_options");
+    try r3.select(opt.trace_include, opt.trace_exclude);
+    TRACE("ATEN-TEST-INITIALIZE", .{});
 }
 
 test "Aten-immediate-quit" {
@@ -1744,7 +1835,7 @@ test "Aten-immediate-quit" {
     var app = TestApp{ .aten = aten };
     try app.run();
     const runtime = elapsed(start_instant, try std.time.Instant.now());
-    try std.testing.expectApproxEqRel(0.0, runtime, 0.5);
+    try std.testing.expectApproxEqAbs(0.0, runtime, 0.5);
 }
 
 test "Aten-timed-quit" {
@@ -1773,7 +1864,7 @@ test "Aten-timed-quit" {
     var app = TestApp{ .aten = aten };
     try app.run();
     const runtime = elapsed(start_instant, try std.time.Instant.now());
-    try std.testing.expectApproxEqRel(5.3, runtime, 0.5);
+    try std.testing.expectApproxEqAbs(5.3, runtime, 0.5);
 }
 
 test "Aten-overdue-quit" {
@@ -1802,7 +1893,7 @@ test "Aten-overdue-quit" {
     var app = TestApp{ .aten = aten };
     try app.run();
     const runtime = elapsed(start_instant, try std.time.Instant.now());
-    try std.testing.expectApproxEqRel(0.0, runtime, 0.5);
+    try std.testing.expectApproxEqAbs(0.0, runtime, 0.5);
 }
 
 test "Aten-read-in-stream" {
@@ -1881,6 +1972,7 @@ test "Aten-read-in-stream" {
         return err;
     }
     const runtime = elapsed(start_instant, try std.time.Instant.now());
-    const expected_duration: f32 = @floatFromInt(test_data.len);
-    try std.testing.expectApproxEqRel(expected_duration, runtime, 0.5);
+    // +1 for EOF
+    const expected_duration: f32 = @floatFromInt(test_data.len + 1);
+    try std.testing.expectApproxEqAbs(expected_duration, runtime, 0.5);
 }

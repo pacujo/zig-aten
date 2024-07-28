@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
 //   zig build -Dtest-filter=SUBSTR [ -Dtest-filter=SUBSTR ] ... test
 const AtenBuild = struct {
     b: *std.Build,
+    root_source_file: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     dep_r3: *std.Build.Dependency,
@@ -31,6 +32,7 @@ const AtenBuild = struct {
 
     fn init(self: *AtenBuild, builder: *std.Build) void {
         self.b = builder;
+        self.root_source_file = "src/Aten.zig";
         self.target = self.b.standardTargetOptions(.{});
         self.optimize = self.b.standardOptimizeOption(.{});
     }
@@ -44,7 +46,7 @@ const AtenBuild = struct {
 
     fn declareModule(self: *AtenBuild) void {
         const module = self.b.addModule("Aten", .{
-            .root_source_file = self.b.path("src/Aten.zig"),
+            .root_source_file = self.b.path(self.root_source_file),
             .target = self.target,
             .optimize = self.optimize,
         });
@@ -54,7 +56,7 @@ const AtenBuild = struct {
     fn declareTests(self: *AtenBuild) void {
         var test_filter_work_area: [100][]const u8 = undefined;
         self.tests = self.b.addTest(.{
-            .root_source_file = self.b.path("src/tests.zig"),
+            .root_source_file = self.b.path(self.root_source_file),
             .target = self.target,
             .optimize = self.optimize,
             .filters = self.getTestFilters(&test_filter_work_area),
