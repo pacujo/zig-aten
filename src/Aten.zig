@@ -30,9 +30,13 @@ registrations: RegistrationMap,
 quit: bool,
 multiplexer: Multiplexer,
 recent: PointInTime,
-mach_clock: if (os.tag == .macos) os.clock_serv_t else void,
+hw_clock: clock_serv_t,
 
 const Aten = @This();
+const clock_serv_t = switch (os.tag) {
+    .macos => os.clock_serv_t,
+    else => void,
+};
 const Multiplexer = switch (os.tag) {
     .linux => TimerFdMultiplexer,
     // .linux => PipeMultiplexer, // if timerfd is not available
@@ -50,11 +54,12 @@ const Multiplexer = switch (os.tag) {
 pub fn create(allocator: std.mem.Allocator) !*Aten {
     const multiplexer = try Multiplexer.make();
     const aten = allocator.create(Aten) catch unreachable;
+    var hw_clock: clock_serv_t = undefined;
     if (os.tag == .macos) {
         os.host_get_clock_service(
             os.mach_host_self(),
             os.SYSTEM_CLOCK,
-            &aten.mach_clock,
+            &hw_clock,
         );
     }
     aten.* = .{
@@ -65,10 +70,9 @@ pub fn create(allocator: std.mem.Allocator) !*Aten {
         .registrations = RegistrationMap.init(allocator),
         .quit = false,
         .multiplexer = multiplexer,
-        .mach_clock = undefined,
-        .recent = undefined,
+        .hw_clock = hw_clock,
+        .recent = PointInTime.getJitteryClock(hw_clock),
     };
-    _ = aten.now(); // initialize self.recent
     TRACE("ATEN-CREATE UID={}", .{aten.uid});
     return aten;
 }
@@ -91,7 +95,7 @@ pub fn destroy(self: *Aten) void {
     }
     self.registrations.deinit();
     if (os.tag == .macos) {
-        os.mach_port_deallocate(os.mach_task_self(), self.mach_clock);
+        os.mach_port_deallocate(os.mach_task_self(), self.hw_clock);
     }
     self.multiplexer.close();
     self.allocator.destroy(self);
@@ -116,23 +120,16 @@ pub fn dupe(self: *Aten, orig: []const u8) []u8 {
 /// Return the current point in time, which can be assumed to grow
 /// monotonically.
 pub fn now(self: *Aten) PointInTime {
-    switch (os.tag) {
-        .linux => {
-            var t: os.timespec = undefined;
-            _ = os.clock_gettime(os.CLOCK.MONOTONIC, &t);
-            self.recent.set(@intCast(t.tv_sec * 1_000_000_000 + t.tv_nsec));
+    self.recent = switch (os.tag) {
+        .linux, .macos => PointInTime.getMonotonicClock(self.hw_clock),
+        else => blk: {
+            const timestamp = PointInTime.getJitteryClock(self.hw_clock);
+            break :blk if (timestamp.order(self.recent) == .gt)
+                timestamp
+            else
+                self.recent.add(Duration.us);
         },
-        .macos => {
-            var t: std.c.darwin.mach_timespec_t = undefined;
-            _ = std.c.darwin.clock_get_time(self.mach_clock, &t);
-            self.recent.set(t.tv_sec * 1_000_000_000 + t.tv_nsec);
-        },
-        else => {
-            var t: os.timeval = undefined;
-            _ = os.gettimeofday(&t, 0);
-            self.recent.set(t.tv_sec * 1_000_000 + t.tv_usec);
-        },
-    }
+    };
     TRACE("ATEN-NOW UID={} TIME={}", .{ self.uid, self.recent });
     return self.recent;
 }
@@ -606,8 +603,40 @@ pub const Action = struct {
 pub const PointInTime = struct {
     ns_since_epoch: u64,
 
-    fn set(self: *PointInTime, ns: u64) void {
-        self.ns_since_epoch = ns;
+    fn getMonotonicClock(hw_clock: clock_serv_t) PointInTime {
+        switch (os.tag) {
+            .linux => {
+                var t: os.timespec = undefined;
+                _ = os.clock_gettime(os.CLOCK.MONOTONIC, &t);
+                return .{
+                    .ns_since_epoch = @intCast(
+                        t.tv_sec * 1_000_000_000 + t.tv_nsec,
+                    ),
+                };
+            },
+            .macos => {
+                var t: std.c.darwin.mach_timespec_t = undefined;
+                _ = std.c.darwin.clock_get_time(hw_clock, &t);
+                return .{
+                    .ns_since_epoch = t.tv_sec * 1_000_000_000 + t.tv_nsec,
+                };
+            },
+            else => unreachable,
+        }
+    }
+
+    fn getJitteryClock(hw_clock: clock_serv_t) PointInTime {
+        switch (os.tag) {
+            .linux, .macos => {
+                return getMonotonicClock(hw_clock);
+            },
+            else => {
+                var t: os.timeval = undefined;
+                _ = os.gettimeofday(&t, 0);
+                const us = t.tv_sec * 1_000_000 + t.tv_usec;
+                return .{ .ns_since_epoch = us * 1_000 };
+            },
+        }
     }
 
     pub fn add(self: PointInTime, delta: Duration) PointInTime {
