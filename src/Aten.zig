@@ -1673,3 +1673,8 @@ pub const QueueStream = @import("QueueStream.zig");
 
 /// A byte stream that emits an unending sequence of zero bytes.
 pub const ZeroStream = @import("ZeroStream.zig");
+
+test "Testing testing" {
+    TRACE("TESTING", .{});
+    // try std.testing.expectEqualSlices(u8, "test", "test");
+}
