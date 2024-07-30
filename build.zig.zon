@@ -3,7 +3,7 @@
     .version = "0.1.1",
     .dependencies = .{
         .r3 = .{
-            .url = "https://github.com/pacujo/zig-r3/archive/refs/tags/v0.1.1.tar.gz",
+            .url = "https://github.com/pacujo/zig-r3/archive/refs/tags/v0.1.2.tar.gz",
             .hash = "12201c0948e64043ae8d5cf30402a240926eda68507f723168be62b055f68aa6d91b",
         },
     },

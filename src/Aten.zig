@@ -247,52 +247,61 @@ pub fn getFd(self: *Aten) fd_t {
 /// (at the latest) even if `getFd()` is not triggered.
 pub fn poll(self: *Aten) !?PointInTime {
     try self.setUpWakeup();
-    self.armWakeup();
-    var events: [1]*Event = undefined;
-    const count = self.multiplexer.waitForEvents(
-        &events,
-        Duration.zero,
-    ) catch |err| {
-        TRACE("ATEN-POLL-FAIL UID={} ERR={}", .{ self.uid, err });
-        return err;
-    };
-    if (count == 1) {
-        TRACE("ATEN-POLL-CALL-BACK UID={} EVENT={}", //
-            .{ self.uid, events[0].uid });
-        events[0].trigger();
-        return self.scheduleWakeup(self.recent);
-    }
-    TRACE("ATEN-POLL-SPURIOUS UID={}", .{self.uid});
-    if (self.earliestTimer()) |timer| {
-        if (timer.expires.order(self.now()) == .gt) {
-            TRACE("ATEN-POLL-NEXT-TIMER UID={} EXPIRES={}", //
-                .{ self.uid, timer.expires });
-            return self.scheduleWakeup(timer.expires);
-        }
-        const action = timer.action;
-        TRACE("ATEN-POLL-TIMEOUT SEQ-NO={} ACT={}", //
-            .{ timer.seq_no, timer.action });
-        if (TRACE_ENABLED("ATEN-TIMER-BT")) {
-            if (timer.stack_trace) |stack_trace| {
-                TRACE("ATEN-TIMER-BT SEQ-NO={} BT={}", //
-                    .{ timer.seq_no, stack_trace });
+    const nextWakeup: ?PointInTime = blk: {
+        if (self.earliestTimer()) |timer| {
+            if (timer.expires.order(self.now()) == .gt) {
+                TRACE("ATEN-POLL-NEXT-TIMER UID={} EXPIRES={}", //
+                    .{ self.uid, timer.expires });
+                break :blk timer.expires;
             }
+            const action = timer.action;
+            TRACE("ATEN-POLL-TIMEOUT SEQ-NO={} ACT={}", //
+                .{ timer.seq_no, timer.action });
+            if (TRACE_ENABLED("ATEN-TIMER-BT")) {
+                if (timer.stack_trace) |stack_trace| {
+                    TRACE("ATEN-TIMER-BT SEQ-NO={} BT={}", //
+                        .{ timer.seq_no, stack_trace });
+                }
+            }
+            timer.cancel();
+            action.perform();
+            break :blk self.recent;
         }
-        timer.cancel();
-        action.perform();
-        return self.scheduleWakeup(self.recent);
+        self.cancelWakeup(); // not absolutely necessary
+        TRACE("ATEN-POLL-NO-TIMERS UID={}", .{self.uid});
+        break :blk null;
+    };
+    var events: [1]*Event = undefined;
+    while (true) {
+        const count = self.multiplexer.waitForEvents(
+            &events,
+            Duration.zero,
+        ) catch |err| {
+            TRACE("ATEN-POLL-FAIL UID={} ERR={}", .{ self.uid, err });
+            return err;
+        };
+        if (count == 0) {
+            TRACE("ATEN-POLL-SPURIOUS UID={}", .{self.uid});
+            return nextWakeup;
+        }
+        self.armWakeup();
+        if (events[0] != &SentinelEvent) {
+            TRACE("ATEN-POLL-CALL-BACK UID={} EVENT={}", //
+                .{ self.uid, events[0].uid });
+            events[0].trigger();
+            return self.recent;
+        }
+        TRACE("ATEN-POLL-SKIP-SENTINEL UID={}", .{self.uid});
     }
-    self.cancelWakeup(); // not absolutely necessary
-    TRACE("ATEN-POLL-NO-TIMERS UID={}", .{self.uid});
-    return null;
 }
 
 /// On modern Linux systems, `poll2` can be used instead of `poll`.
 /// The return value does not require the foreign main loop to wake up
 /// at a particular time but can simply monitor `getFd()`.
 pub fn poll2(self: *Aten) !void {
-    const nextTimeout = try self.poll();
-    std.debug.assert(nextTimeout == null);
+    if (try self.poll()) |wakeup| {
+        self.scheduleWakeup(wakeup);
+    }
 }
 
 /// Make `loop` (the native main loop) return immediately.
@@ -486,7 +495,8 @@ pub fn unregister(self: *Aten, fd: fd_t) !void {
         return err;
     };
     const event = self.registrations.get(fd) orelse unreachable;
-    event.destroy();
+    if (event != &SentinelEvent)
+        event.destroy();
     if (!self.registrations.remove(fd))
         unreachable;
     TRACE("ATEN-UNREGISTER UID={} FD={}", .{ self.uid, fd });
@@ -511,10 +521,9 @@ fn wakeUp(self: *Aten) void {
     self.multiplexer.wakeUp();
 }
 
-fn scheduleWakeup(self: *Aten, expires: PointInTime) ?PointInTime {
-    const target = self.multiplexer.scheduleWakeup(expires);
-    TRACE("ATEN-WAKE-UP UID={} TIME={?}", .{ self.uid, target });
-    return target;
+fn scheduleWakeup(self: *Aten, expires: PointInTime) void {
+    TRACE("ATEN-WAKE-UP UID={} TIME={?}", .{ self.uid, expires });
+    self.multiplexer.scheduleWakeup(expires);
 }
 
 fn cancelWakeup(self: *Aten) void {
@@ -1088,15 +1097,11 @@ const TimerFdMultiplexer = struct {
         }
     }
 
-    fn scheduleWakeup(
-        self: TimerFdMultiplexer,
-        expires: PointInTime,
-    ) ?PointInTime {
+    fn scheduleWakeup(self: TimerFdMultiplexer, expires: PointInTime) void {
         self.setWakeupTime(.{
             .it_interval = undefined,
             .it_value = expires.toTimespec(),
         });
-        return null;
     }
 
     fn cancelWakeup(self: TimerFdMultiplexer) void {
@@ -1195,12 +1200,9 @@ const PipeMultiplexer = struct {
         }
     }
 
-    fn scheduleWakeup(
-        self: PipeMultiplexer,
-        expires: PointInTime,
-    ) ?PointInTime {
+    fn scheduleWakeup(self: PipeMultiplexer, expires: PointInTime) void {
         _ = self;
-        return expires;
+        _ = expires;
     }
 
     fn cancelWakeup(self: PipeMultiplexer) void {
@@ -1364,15 +1366,11 @@ const KqueueMultiplexer = struct {
         ) catch unreachable;
     }
 
-    fn scheduleWakeup(
-        self: PipeMultiplexer,
-        expires: PointInTime,
-    ) ?PointInTime {
+    fn scheduleWakeup(self: PipeMultiplexer, expires: PointInTime) void {
         const delay = expires.sub(self.now());
         self.setWakeupTime(
             if (delay.order(Duration.zero) == .gt) delay else Duration.zero,
         );
-        return null;
     }
 
     fn cancelWakeup(self: KqueueMultiplexer) void {
@@ -1789,13 +1787,7 @@ pub const QueueStream = @import("QueueStream.zig");
 /// A byte stream that emits an unending sequence of zero bytes.
 pub const ZeroStream = @import("ZeroStream.zig");
 
-pub fn testingAllocator() std.mem.Allocator {
-    const S = struct {
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        const allocator = gpa.allocator();
-    };
-    return S.allocator;
-}
+const TestingAllocator = std.heap.GeneralPurposeAllocator(.{});
 
 pub fn elapsed(
     start_instant: std.time.Instant,
@@ -1817,6 +1809,8 @@ test "Aten-immediate-quit" {
     TRACE("ATEN-TEST-BEGIN TEST={}", .{test_name});
     defer TRACE("ATEN-TEST-END TEST={}", .{test_name});
     errdefer TRACE("ATEN-TEST-FAIL TEST={}", .{test_name});
+    var testingAllocator = TestingAllocator{};
+    defer _ = testingAllocator.deinit();
     const start_instant = try std.time.Instant.now();
 
     const TestApp = struct {
@@ -1830,7 +1824,7 @@ test "Aten-immediate-quit" {
         }
     };
 
-    const aten = try Aten.create(testingAllocator());
+    const aten = try Aten.create(testingAllocator.allocator());
     defer aten.destroy();
     var app = TestApp{ .aten = aten };
     try app.run();
@@ -1843,6 +1837,8 @@ test "Aten-timed-quit" {
     TRACE("ATEN-TEST-BEGIN TEST={}", .{test_name});
     defer TRACE("ATEN-TEST-END TEST={}", .{test_name});
     errdefer TRACE("ATEN-TEST-FAIL TEST={}", .{test_name});
+    var testingAllocator = TestingAllocator{};
+    defer _ = testingAllocator.deinit();
     const start_instant = try std.time.Instant.now();
 
     const TestApp = struct {
@@ -1859,7 +1855,7 @@ test "Aten-timed-quit" {
         }
     };
 
-    const aten = try Aten.create(testingAllocator());
+    const aten = try Aten.create(testingAllocator.allocator());
     defer aten.destroy();
     var app = TestApp{ .aten = aten };
     try app.run();
@@ -1872,6 +1868,8 @@ test "Aten-overdue-quit" {
     TRACE("ATEN-TEST-BEGIN TEST={}", .{test_name});
     defer TRACE("ATEN-TEST-END TEST={}", .{test_name});
     errdefer TRACE("ATEN-TEST-FAIL TEST={}", .{test_name});
+    var testingAllocator = TestingAllocator{};
+    defer _ = testingAllocator.deinit();
     const start_instant = try std.time.Instant.now();
 
     const TestApp = struct {
@@ -1888,7 +1886,7 @@ test "Aten-overdue-quit" {
         }
     };
 
-    const aten = try Aten.create(testingAllocator());
+    const aten = try Aten.create(testingAllocator.allocator());
     defer aten.destroy();
     var app = TestApp{ .aten = aten };
     try app.run();
@@ -1901,11 +1899,14 @@ test "Aten-read-in-stream" {
     TRACE("ATEN-TEST-BEGIN TEST={}", .{test_name});
     defer TRACE("ATEN-TEST-END TEST={}", .{test_name});
     errdefer TRACE("ATEN-TEST-FAIL TEST={}", .{test_name});
+    var testingAllocator = TestingAllocator{};
+    defer _ = testingAllocator.deinit();
     const start_instant = try std.time.Instant.now();
 
     const TestApp = struct {
         aten: *Aten,
         feed: ByteStream,
+        done: bool,
         verdict: ?anyerror,
 
         const Self = @This();
@@ -1918,6 +1919,7 @@ test "Aten-read-in-stream" {
                 Action.make(self, timedOut),
             );
             try self.aten.loop();
+            try self.aten.flush(self.aten.now().add(Duration.s));
         }
 
         fn timedOut(self: *Self) void {
@@ -1927,6 +1929,8 @@ test "Aten-read-in-stream" {
         }
 
         fn probe(self: *Self) void {
+            if (self.done)
+                return;
             var buffer: [100]u8 = undefined;
             while (true) {
                 const count = self.feed.read(&buffer) catch |err| {
@@ -1940,6 +1944,8 @@ test "Aten-read-in-stream" {
                 };
                 if (count == 0) {
                     TRACE("ATEN-TEST-PROBE-EOF", .{});
+                    self.feed.close();
+                    self.done = true;
                     self.aten.quitLoop();
                     return;
                 }
@@ -1950,7 +1956,7 @@ test "Aten-read-in-stream" {
         }
     };
 
-    const aten = try Aten.create(testingAllocator());
+    const aten = try Aten.create(testingAllocator.allocator());
     defer aten.destroy();
     const test_data = "Hello, world!";
     const blob_stream = BlobStream.make(aten, test_data);
@@ -1961,9 +1967,9 @@ test "Aten-read-in-stream" {
         1,
         1,
     );
-    defer pacer_stream.close();
     var app = TestApp{
         .aten = aten,
+        .done = false,
         .feed = ByteStream.from(pacer_stream),
         .verdict = null,
     };
