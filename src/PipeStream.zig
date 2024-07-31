@@ -1,3 +1,5 @@
+//! A pipe stream converts an open file descriptor to a byte stream.
+
 const std = @import("std");
 const r3 = @import("r3");
 const Aten = @import("Aten.zig");
@@ -5,7 +7,6 @@ const Action = Aten.Action;
 const ByteStream = Aten.ByteStream;
 const fd_t = Aten.fd_t;
 const TRACE = r3.trace;
-const TRACE_ENABLED = r3.enabled;
 
 aten: *Aten,
 uid: r3.UID,
@@ -18,6 +19,7 @@ const PipeStream = @This();
 const State = enum { open, closed };
 pub const Monitor = enum { yes, no, if_possible };
 
+/// Read from a pipe stream.
 pub fn read(self: *PipeStream, buffer: []u8) !usize {
     std.debug.assert(self.state != .closed);
     const count = Aten.read(self.fd, buffer) catch |err| {
@@ -32,6 +34,7 @@ pub fn read(self: *PipeStream, buffer: []u8) !usize {
     return count;
 }
 
+/// Close a pipe stream and the associated file descriptor with it.
 pub fn close(self: *PipeStream) void {
     TRACE("ATEN-PIPESTREAM-CLOSE UID={}", .{self.uid});
     std.debug.assert(self.state != .closed);
@@ -42,11 +45,21 @@ pub fn close(self: *PipeStream) void {
     self.aten.wound(self);
 }
 
+/// Subscribe to readability notifications.
 pub fn subscribe(self: *PipeStream, action: Action) void {
     TRACE("ATEN-PIPESTREAM-SUBSCRIBE UID={} ACT={}", .{ self.uid, action });
     self.callback = action;
 }
 
+/// Create a byte stream wrapper for an open, readable file
+/// descriptor. If `monitor` is `.yes`, the file descriptor is made
+/// nonblocking and registered for readability notifications. This may
+/// fail for some file types such as regular files. The `monitor`
+/// value `.no` should be used for regular files, which are always
+/// readable. The value `.if_possible` tries the register the file
+/// descriptor for notifications but does not cause a failure if the
+/// registration fails; this value can be used if the file type is not
+/// known at compile time.
 pub fn make(aten: *Aten, fd: fd_t, monitor: Monitor) !*PipeStream {
     const self = aten.alloc(PipeStream);
     self.* = .{
@@ -59,9 +72,7 @@ pub fn make(aten: *Aten, fd: fd_t, monitor: Monitor) !*PipeStream {
     };
     if (monitor != .no) {
         self.monitored = true;
-        const probe = ByteStream.makeCallbackProbe(PipeStream);
-        const action = Action.make(self, probe);
-        aten.register(fd, action) catch |err| {
+        aten.register(fd, ByteStream.makeCallbackProbe(self)) catch |err| {
             self.monitored = false;
             if (monitor == .yes or err != error.EPERM) {
                 TRACE("ATEN-PIPESTREAM-CREATE-FAIL UID={} ATEN={} FD={} " ++

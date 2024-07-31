@@ -1,3 +1,8 @@
+//! A queue of byte streams. A queue stream offers a way to "write"
+//! into one end of a byte stream and read it from the other end.
+//! Instead of writing individual bytes to a queue stream, other byte
+//! streams are enqueued to it.
+
 const std = @import("std");
 const r3 = @import("r3");
 const Aten = @import("Aten.zig");
@@ -6,7 +11,6 @@ const Event = Aten.Event;
 const BlobStream = Aten.BlobStream;
 const ByteStream = Aten.ByteStream;
 const TRACE = r3.trace;
-const TRACE_ENABLED = r3.enabled;
 
 aten: *Aten,
 uid: r3.UID,
@@ -31,6 +35,8 @@ fn notify(self: *QueueStream) void {
 }
 
 fn doRead(self: *QueueStream, buffer: []u8) !usize {
+    if (buffer.len == 0)
+        return 0;
     while (self.queue.first) |first_node| {
         const substream = first_node.data;
         const count = substream.read(buffer) catch |err| {
@@ -52,6 +58,14 @@ fn doRead(self: *QueueStream, buffer: []u8) !usize {
     return 0;
 }
 
+/// Read from a queue stream. If the queue is empty but the queue
+/// stream has not been terminated, `error.EAGAIN` is returned. If the
+/// queue is empty and teh queue stream has been terminated, `0` is
+/// returned.
+///
+/// Otherwise, deliver bytes from the first underlying byte stream in
+/// the queue. If it is exhausted, it is closed and removed and
+/// reading moves to the next byte stream in the queue.
 pub fn read(self: *QueueStream, buffer: []u8) !usize {
     std.debug.assert(self.consumption_state == .open);
     const count = self.doRead(buffer) catch |err| {
@@ -74,6 +88,7 @@ fn flushQueue(self: *QueueStream) void {
     }
 }
 
+/// Close a queue stream and all enqueued underlying byte streams.
 pub fn close(self: *QueueStream) void {
     std.debug.assert(self.consumption_state == .open);
     TRACE("ATEN-QUEUESTREAM-CLOSE UID={} P-STATE={}", //
@@ -86,15 +101,18 @@ pub fn close(self: *QueueStream) void {
     }
 }
 
+/// Subscribe to readability notifications.
 pub fn subscribe(self: *QueueStream, action: Action) void {
     TRACE("ATEN-QUEUESTREAM-SUBSCRIBE UID={} ACT={}", .{ self.uid, action });
     self.callback = action;
 }
 
+/// Create a queue stream with an empty queue of underlying byte
+/// streams. Byte streams can be appended to the queue with `enqueue`
+/// and prepended with `push`.
 pub fn make(aten: *Aten) *QueueStream {
     const self = aten.alloc(QueueStream);
-    const probe = ByteStream.makeCallbackProbe(QueueStream);
-    const notifier = Event.make(aten, Action.make(self, probe));
+    const notifier = Event.make(aten, ByteStream.makeCallbackProbe(self));
     self.* = .{
         .aten = aten,
         .uid = r3.newUID(),
@@ -115,6 +133,8 @@ pub fn make(aten: *Aten) *QueueStream {
     return self;
 }
 
+/// Append a byte stream to the queue of a queue stream. If the user
+/// is due it, a notification is issued.
 pub fn enqueue(self: *QueueStream, substream: ByteStream) void {
     std.debug.assert(self.production_state == .open);
     const node = self.aten.alloc(Queue.Node);
@@ -129,6 +149,8 @@ pub fn enqueue(self: *QueueStream, substream: ByteStream) void {
     }
 }
 
+/// Prepend a byte stream to the queue of a queue stream. If the user
+/// is due it, a readability notification is issued.
 pub fn push(self: *QueueStream, substream: ByteStream) void {
     std.debug.assert(self.production_state == .open);
     const node = self.aten.alloc(Queue.Node);
@@ -141,12 +163,16 @@ pub fn push(self: *QueueStream, substream: ByteStream) void {
     }
 }
 
+/// A convenience function to enqueue a blob of bytes. The blob is
+/// copied.
 pub fn enqueueBlob(self: *QueueStream, blob: []const u8) void {
     TRACE("ATEN-QUEUESTREAM-ENQUEUE-BLOB UID={} BLOB={}", //
         .{ self.uid, r3.str(blob) });
     self.enqueue(ByteStream.from(BlobStream.copy(self.aten, blob)));
 }
 
+/// A convenience function to push a blob of bytes. The blob is
+/// copied.
 pub fn pushBlob(self: *QueueStream, blob: []const u8) void {
     TRACE("ATEN-QUEUESTREAM-ENQUEUE-BLOB UID={} BLOB={}", //
         .{ self.uid, r3.str(blob) });
@@ -160,6 +186,9 @@ fn wrapUp(self: *QueueStream) void {
     self.aten.wound(self);
 }
 
+/// Inform a queue stream that no more data will be enqueued or
+/// pushed. If the user is due it, a readability notification is
+/// issued.
 pub fn terminate(self: *QueueStream) void {
     std.debug.assert(self.production_state == .open);
     TRACE("ATEN-QUEUESTREAM-TERMINATE UID={}", .{self.uid});

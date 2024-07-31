@@ -117,6 +117,11 @@ pub fn dupe(self: *Aten, orig: []const u8) []u8 {
     return self.allocator.dupe(u8, orig) catch unreachable;
 }
 
+/// Free a block of bytes allocated with `dupe`.
+pub fn free(self: *Aten, memory: anytype) void {
+    return self.allocator.free(memory);
+}
+
 /// Return the current point in time, which can be assumed to grow
 /// monotonically.
 pub fn now(self: *Aten) PointInTime {
@@ -657,21 +662,25 @@ pub const PointInTime = struct {
         }
     }
 
+    /// Add a duration to the point in time.
     pub fn add(self: PointInTime, delta: Duration) PointInTime {
         const udelta: u64 = @bitCast(delta.ns_delta);
         return .{ .ns_elapsed = self.ns_elapsed +% udelta };
     }
 
+    /// Subtract a duration from the point in time.
     pub fn sub(self: PointInTime, delta: Duration) PointInTime {
         const udelta: u64 = @bitCast(delta.ns_delta);
         return .{ .ns_elapsed = self.ns_elapsed -% udelta };
     }
 
+    /// Calculate the duration from this to another point in time.
     pub fn diff(self: PointInTime, other: PointInTime) Duration {
         const udelta: u64 = self.ns_elapsed -% other.ns_elapsed;
         return .{ .ns_delta = @bitCast(udelta) };
     }
 
+    /// Compare two points in time.
     pub fn order(self: PointInTime, other: PointInTime) std.math.Order {
         return std.math.order(self.ns_elapsed, other.ns_elapsed);
     }
@@ -735,14 +744,16 @@ pub const Duration = struct {
     }
 
     /// The sum of two durations.
-    pub fn add(self: Duration, other: Duration) PointInTime {
+    pub fn add(self: Duration, other: Duration) Duration {
         return .{ .ns_delta = self.ns_delta +% other.ns_delta };
     }
 
+    /// The difference between two durations.
     pub fn sub(self: Duration, other: Duration) Duration {
         return .{ .ns_delta = self.ns_delta -% other.ns_delta };
     }
 
+    /// Compare two durations.
     pub fn order(self: Duration, other: Duration) std.math.Order {
         return std.math.order(self.ns_delta, other.ns_delta);
     }
@@ -755,7 +766,7 @@ pub const Duration = struct {
 
     /// Construct a duration from a number of seconds.
     pub fn from(seconds: anytype) Duration {
-        return .{ .ns_delta = @intFromFloat(seconds * 1e9) };
+        return .{ .ns_delta = std.math.lossyCast(i64, seconds * 1e9) };
     }
 
     /// Return `true` iff the duration is less than zero.
@@ -1774,6 +1785,10 @@ pub const DryStream = DummyStream(error.EAGAIN);
 pub const EmptyStream = DummyStream(0);
 
 /// A byte stream that emits the output of the underlying byte stream
+/// yielding after excessively long bursts.
+pub const NiceStream = @import("NiceStream.zig");
+
+/// A byte stream that emits the output of the underlying byte stream
 /// at a constant rate.
 pub const PacerStream = @import("PacerStream.zig");
 
@@ -1789,6 +1804,7 @@ pub const ZeroStream = @import("ZeroStream.zig");
 
 const TestingAllocator = std.heap.GeneralPurposeAllocator(.{});
 
+/// Return the number of seconds elapsed between two instants.
 pub fn elapsed(
     start_instant: std.time.Instant,
     end_instant: std.time.Instant,

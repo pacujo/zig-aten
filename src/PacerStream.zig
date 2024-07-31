@@ -1,3 +1,5 @@
+//! Perform rate limiting for an underlying byte stream.
+
 const std = @import("std");
 const r3 = @import("r3");
 const Aten = @import("Aten.zig");
@@ -7,7 +9,6 @@ const PointInTime = Aten.PointInTime;
 const Duration = Aten.Duration;
 const Timer = Aten.Timer;
 const TRACE = r3.trace;
-const TRACE_ENABLED = r3.enabled;
 
 aten: *Aten,
 uid: r3.UID,
@@ -33,6 +34,7 @@ fn retry(self: *PacerStream) void {
     self.callback.perform();
 }
 
+/// Read from a pacer stream honoring the rate parameters.
 pub fn read(self: *PacerStream, buffer: []u8) !usize {
     std.debug.assert(self.state != .closed);
     if (self.retry_timer) |timer| {
@@ -55,7 +57,7 @@ pub fn read(self: *PacerStream, buffer: []u8) !usize {
             .{ self.uid, buffer.len, delay });
         return error.EAGAIN;
     }
-    const limit = @min(buffer.len, @as(usize, @intFromFloat(self.quota)));
+    const limit = @min(buffer.len, std.math.lossyCast(usize, self.quota));
     const count = self.underlying_stream.read(buffer[0..limit]) catch |err| {
         TRACE("ATEN-PACERSTREAM-READ-FAIL UID={} WANT={} LIMIT={} ERR={}", //
             .{ self.uid, buffer.len, limit, err });
@@ -69,6 +71,7 @@ pub fn read(self: *PacerStream, buffer: []u8) !usize {
     return count;
 }
 
+/// Close a pipe stream and the underlying byte stream with it.
 pub fn close(self: *PacerStream) void {
     TRACE("ATEN-PACERSTREAM-CLOSE UID={}", .{self.uid});
     std.debug.assert(self.state != .closed);
@@ -80,11 +83,22 @@ pub fn close(self: *PacerStream) void {
     self.aten.wound(self);
 }
 
+/// Subscribe to readability notifications.
 pub fn subscribe(self: *PacerStream, action: Action) void {
     TRACE("ATEN-PACERSTREAM-SUBSCRIBE UID={} ACT={}", .{ self.uid, action });
     self.callback = action;
 }
 
+/// Create a pacer stream on top of an underlying byte stream. The
+/// pacer stream delivers the same bytes as the underlying stream at
+/// the given constant data rate. Notifications are for more data are
+/// timed so reads would deliver data in chunks no smaller than
+/// `min_burst` bytes.
+///
+/// If the `read` rate temporarily falls behind the target byte rate,
+/// the stream "catches up" within the limits of `max_burst`. A
+/// shortfall larger than `max_burst` results in a dip in the data
+/// rate that is not caught up with.
 pub fn make(
     aten: *Aten,
     underlying_stream: ByteStream,
@@ -106,9 +120,7 @@ pub fn make(
         .quota = 0,
         .prev_t = aten.now(),
     };
-    const probe = ByteStream.makeCallbackProbe(PacerStream);
-    const action = Action.make(self, probe);
-    underlying_stream.subscribe(action);
+    underlying_stream.subscribe(ByteStream.makeCallbackProbe(self));
     TRACE("ATEN-PACERSTREAM-CREATE UID={} PTR={} ATEN={} U-STR={} " ++
         "RATE={d} MIN={d} MAX={d}", .{
         self.uid,
