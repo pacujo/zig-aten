@@ -27,7 +27,7 @@ pub fn read(self: *NiceStream, buffer: []u8) !usize {
         TRACE("ATEN-NICESTREAM-BACK-OFF UID={} WANT={}", //
             .{ self.uid, buffer.len });
         self.this_burst = 0;
-        self.aten.execute(self.makeCallbackProbe(self));
+        _ = self.aten.execute(ByteStream.makeCallbackProbe(self));
         return error.EAGAIN;
     }
     const count = self.underlying_stream.read(buffer) catch |err| {

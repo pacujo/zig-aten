@@ -134,6 +134,7 @@ pub fn make(
     return self;
 }
 
+/// Reset the rate calculation.
 pub fn reset(self: *PacerStream) void {
     TRACE("ATEN-PACERSTREAM-RESET UID={}", .{self.uid});
     self.quota = 0;

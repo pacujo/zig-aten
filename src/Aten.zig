@@ -1799,6 +1799,10 @@ pub const PipeStream = @import("PipeStream.zig");
 /// In particular, a `QueueStream` is used to transmit data.
 pub const QueueStream = @import("QueueStream.zig");
 
+/// A substream delivers bytes from the middle of an underlying byte
+/// stream.
+pub const Substream = @import("Substream.zig");
+
 /// A byte stream that emits an unending sequence of zero bytes.
 pub const ZeroStream = @import("ZeroStream.zig");
 
