@@ -7,30 +7,38 @@ const r3 = @import("r3");
 const Aten = @import("Aten.zig");
 const Action = Aten.Action;
 
-object: *const anyopaque,
+object: *anyopaque,
 vt: *const Vt,
 
 const ByteStream = @This();
 
+fn ReadFn(comptime T: type) type {
+    return *const fn (object: *T, buffer: []u8) anyerror!usize;
+}
+
+fn CloseFn(comptime T: type) type {
+    return *const fn (object: *T) void;
+}
+
+fn SubscribeFn(comptime T: type) type {
+    return *const fn (object: *T, action: Action) void;
+}
+
 /// The virtual table of the byte stream interface.
-pub const Vt = struct {
-    read: *const fn (object: *const anyopaque, buffer: []u8) anyerror!usize,
-    close: *const fn (object: *const anyopaque) void,
-    subscribe: *const fn (object: *const anyopaque, action: Action) void,
+const Vt = struct {
+    read: ReadFn(anyopaque),
+    close: CloseFn(anyopaque),
+    subscribe: SubscribeFn(anyopaque),
 };
 
 /// Convert any byte stream to a `ByteStream` interface object.
 pub fn from(stream: anytype) ByteStream {
     const Stream = @TypeOf(stream.*);
-    const readFn: *const fn (*Stream, []u8) anyerror!usize = &Stream.read;
-    const closeFn: *const fn (*Stream) void = &Stream.close;
-    const subscribeFn: *const fn (*Stream, Action) void =
-        &Stream.subscribe;
     const S = struct {
         const vt = Vt{
-            .read = @ptrCast(readFn),
-            .close = @ptrCast(closeFn),
-            .subscribe = @ptrCast(subscribeFn),
+            .read = @ptrCast(@as(ReadFn(Stream), &Stream.read)),
+            .close = @ptrCast(@as(CloseFn(Stream), &Stream.close)),
+            .subscribe = @ptrCast(@as(SubscribeFn(Stream), &Stream.subscribe)),
         };
     };
     return .{ .object = @ptrCast(stream), .vt = &S.vt };
