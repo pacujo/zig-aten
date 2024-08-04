@@ -12,36 +12,41 @@ vt: *const Vt,
 
 const ByteStream = @This();
 
-fn ReadFn(comptime T: type) type {
-    return *const fn (object: *T, buffer: []u8) anyerror!usize;
-}
-
-fn CloseFn(comptime T: type) type {
-    return *const fn (object: *T) void;
-}
-
-fn SubscribeFn(comptime T: type) type {
-    return *const fn (object: *T, action: Action) void;
-}
-
 /// The virtual table of the byte stream interface.
 const Vt = struct {
     read: ReadFn(anyopaque),
     close: CloseFn(anyopaque),
     subscribe: SubscribeFn(anyopaque),
+
+    fn ReadFn(comptime T: type) type {
+        return *const fn (object: *T, buffer: []u8) anyerror!usize;
+    }
+
+    fn CloseFn(comptime T: type) type {
+        return *const fn (object: *T) void;
+    }
+
+    fn SubscribeFn(comptime T: type) type {
+        return *const fn (object: *T, action: Action) void;
+    }
+
+    fn from(comptime T: type) type {
+        return struct {
+            const vt = Vt{
+                .read = @ptrCast(@as(ReadFn(T), &T.read)),
+                .close = @ptrCast(@as(CloseFn(T), &T.close)),
+                .subscribe = @ptrCast(@as(SubscribeFn(T), &T.subscribe)),
+            };
+        };
+    }
 };
 
 /// Convert any byte stream to a `ByteStream` interface object.
 pub fn from(stream: anytype) ByteStream {
-    const Stream = @TypeOf(stream.*);
-    const S = struct {
-        const vt = Vt{
-            .read = @ptrCast(@as(ReadFn(Stream), &Stream.read)),
-            .close = @ptrCast(@as(CloseFn(Stream), &Stream.close)),
-            .subscribe = @ptrCast(@as(SubscribeFn(Stream), &Stream.subscribe)),
-        };
+    return .{
+        .object = @ptrCast(stream),
+        .vt = &Vt.from(@TypeOf(stream.*)).vt,
     };
-    return .{ .object = @ptrCast(stream), .vt = &S.vt };
 }
 
 /// Transfer bytes from the stream in a non-blocking fashion. If no
@@ -51,7 +56,7 @@ pub fn from(stream: anytype) ByteStream {
 /// returned. The returned number of bytes is more than `0` unless
 /// `buffer.len` is `0`.
 pub fn read(self: ByteStream, buffer: []u8) !usize {
-    return try self.vt.read(self.object, buffer);
+    return self.vt.read(self.object, buffer);
 }
 
 /// Dismantle the byte stream and release resources associated with
