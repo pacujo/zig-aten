@@ -13,40 +13,15 @@ vt: *const Vt,
 const ByteStream = @This();
 
 /// The virtual table of the byte stream interface.
-const Vt = struct {
-    read: ReadFn(anyopaque),
-    close: CloseFn(anyopaque),
-    subscribe: SubscribeFn(anyopaque),
-
-    fn ReadFn(comptime T: type) type {
-        return *const fn (object: *T, buffer: []u8) anyerror!usize;
-    }
-
-    fn CloseFn(comptime T: type) type {
-        return *const fn (object: *T) void;
-    }
-
-    fn SubscribeFn(comptime T: type) type {
-        return *const fn (object: *T, action: Action) void;
-    }
-
-    fn from(comptime T: type) type {
-        return struct {
-            const vt = Vt{
-                .read = @ptrCast(@as(ReadFn(T), &T.read)),
-                .close = @ptrCast(@as(CloseFn(T), &T.close)),
-                .subscribe = @ptrCast(@as(SubscribeFn(T), &T.subscribe)),
-            };
-        };
-    }
+pub const Vt = struct {
+    read: *const fn (*anyopaque, []u8) anyerror!usize,
+    close: *const fn (*anyopaque) void,
+    subscribe: *const fn (*anyopaque, Action) void,
 };
 
 /// Convert any byte stream to a `ByteStream` interface object.
 pub fn from(stream: anytype) ByteStream {
-    return .{
-        .object = @ptrCast(stream),
-        .vt = &Vt.from(@TypeOf(stream.*)).vt,
-    };
+    return @import("Interface.zig").cast(ByteStream, stream);
 }
 
 /// Transfer bytes from the stream in a non-blocking fashion. If no
